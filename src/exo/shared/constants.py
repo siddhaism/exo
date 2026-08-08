@@ -105,4 +105,16 @@ ENABLE_DISAGGREGATION = os.getenv("ENABLE_DISAGGREGATION", "false").lower() == "
 
 EXO_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXO_MAX_CONCURRENT_REQUESTS", "8"))
 
+# MLX/JACCL communicators can remain alive after a completed generation even
+# though their native Metal/RDMA state is no longer safe to reuse.  Recycling
+# multi-node JACCL instances between requests trades a short reload delay for
+# process isolation and deterministic recovery from native runtime corruption.
+EXO_RECYCLE_DISTRIBUTED_MLX_AFTER_GENERATION = (
+    os.getenv("EXO_RECYCLE_DISTRIBUTED_MLX_AFTER_GENERATION", "true").lower()
+    == "true"
+)
+EXO_DISTRIBUTED_RECYCLE_COOLDOWN_SECONDS = float(
+    os.getenv("EXO_DISTRIBUTED_RECYCLE_COOLDOWN_SECONDS", "5")
+)
+
 EXO_MAX_INSTANCE_RETRIES = 5
