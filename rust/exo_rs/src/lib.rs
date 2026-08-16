@@ -14,6 +14,13 @@ use crate::pidfile::pidfile_submodule;
 use pyo3::prelude::PyModule;
 use pyo3::{Bound, PyResult, pymodule};
 use pyo3_stub_gen::define_stub_info_gatherer;
+#[cfg(target_os = "macos")]
+use std::ffi::c_char;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static environ: *mut *mut c_char;
+}
 
 /// Namespace for crate-wide extension traits/methods
 pub(crate) mod ext {
@@ -148,6 +155,13 @@ pub(crate) mod ext {
 /// import the module.
 #[pymodule(name = "exo_rs", gil_used = true)]
 fn main_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Xcode 27 beta can leave the Mach-O LINKEDIT string table only 4-byte
+    // aligned when the indirect-symbol count is odd. One real system call
+    // keeps that table 8-byte aligned; remove this when the linker is fixed.
+    #[cfg(target_os = "macos")]
+    // SAFETY: reading the process environment pointer does not dereference it.
+    let _ = unsafe { std::ptr::read_volatile(&raw const environ) };
+
     // install logger
     pyo3_log::init();
     let mut builder = tokio::runtime::Builder::new_multi_thread();

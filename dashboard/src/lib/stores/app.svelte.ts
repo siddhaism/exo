@@ -66,6 +66,39 @@ export interface TopologyData {
   edges: TopologyEdge[];
 }
 
+export type NodeHealthStatus = "healthy" | "degraded" | "offline" | "unknown";
+
+export interface NodeHealth {
+  status: NodeHealthStatus;
+  lastSeen: string | null;
+  ageMs: number | null;
+}
+
+export interface ClusterHealth {
+  status: NodeHealthStatus;
+  healthyNodes: number;
+  totalNodes: number;
+  message: string;
+}
+
+export interface ClusterTransportHealth {
+  controlPlane?: {
+    peers?: Record<
+      string,
+      {
+        connected?: boolean;
+        changedAt?: string;
+      }
+    >;
+    reconnectCount?: number;
+    lastError?: string | null;
+  };
+  dataPlane?: {
+    ready?: boolean;
+    runners?: Record<string, string>;
+  };
+}
+
 export interface Instance {
   shardAssignments?: {
     modelId?: string;
@@ -221,6 +254,7 @@ export interface TraceListResponse {
 
 interface RawStateResponse {
   topology?: RawTopology;
+  lastSeen?: Record<string, string>;
   instances?: Record<
     string,
     {
@@ -563,6 +597,14 @@ class AppStore {
   previewNodeFilter = $state<Set<string>>(new Set());
   lastUpdate = $state<number | null>(null);
   nodeIdentities = $state<Record<string, RawNodeIdentity>>({});
+  nodeHealth = $state<Record<string, NodeHealth>>({});
+  clusterHealth = $state<ClusterHealth>({
+    status: "unknown",
+    healthyNodes: 0,
+    totalNodes: 0,
+    message: "Waiting for cluster heartbeats",
+  });
+  clusterTransportHealth = $state<ClusterTransportHealth>({});
   thunderboltBridgeCycles = $state<string[][]>([]);
   nodeThunderbolt = $state<
     Record<
@@ -1322,6 +1364,7 @@ class AppStore {
         });
         // Handle topology changes for preview filter
         this.handleTopologyChange();
+        this.updateClusterHealth(data.topology.nodes, data.lastSeen);
       }
       if (data.instances) {
         this.instances = data.instances;
@@ -1352,6 +1395,7 @@ class AppStore {
       // Thunderbolt bridge status per node
       this.nodeThunderboltBridge = data.nodeThunderboltBridge ?? {};
       this.lastUpdate = Date.now();
+      void this.fetchClusterTransportHealth();
       // Connection recovered
       if (!this.isConnected) {
         this.isConnected = true;
@@ -1366,6 +1410,84 @@ class AppStore {
         this.isConnected = false;
       }
       console.error("Error fetching state:", error);
+    }
+  }
+
+  private async fetchClusterTransportHealth() {
+    try {
+      const response = await fetch("/v1/cluster/health");
+      if (response.ok) {
+        this.clusterTransportHealth =
+          (await response.json()) as ClusterTransportHealth;
+      }
+    } catch {
+      // The main /state request owns backend connectivity reporting.
+    }
+  }
+
+  private updateClusterHealth(
+    nodeIds: string[],
+    lastSeen: Record<string, string> | undefined,
+  ) {
+    const now = Date.now();
+    const health: Record<string, NodeHealth> = {};
+
+    for (const nodeId of nodeIds) {
+      const timestamp = lastSeen?.[nodeId] ?? null;
+      const parsed = timestamp ? Date.parse(timestamp) : NaN;
+      const ageMs = Number.isFinite(parsed) ? Math.max(0, now - parsed) : null;
+      const status: NodeHealthStatus =
+        ageMs === null
+          ? "unknown"
+          : ageMs <= 5_000
+            ? "healthy"
+            : ageMs <= 15_000
+              ? "degraded"
+              : "offline";
+      health[nodeId] = { status, lastSeen: timestamp, ageMs };
+    }
+
+    this.nodeHealth = health;
+    const statuses = Object.values(health);
+    const healthyNodes = statuses.filter(
+      (node) => node.status === "healthy",
+    ).length;
+    const degradedNodes = statuses.filter(
+      (node) => node.status === "degraded",
+    ).length;
+    const offlineNodes = statuses.filter(
+      (node) => node.status === "offline",
+    ).length;
+    const totalNodes = statuses.length;
+
+    if (totalNodes === 0) {
+      this.clusterHealth = {
+        status: "unknown",
+        healthyNodes: 0,
+        totalNodes: 0,
+        message: "Waiting for cluster nodes",
+      };
+    } else if (healthyNodes === totalNodes) {
+      this.clusterHealth = {
+        status: "healthy",
+        healthyNodes,
+        totalNodes,
+        message: `All ${totalNodes} node${totalNodes === 1 ? "" : "s"} online`,
+      };
+    } else if (offlineNodes > 0) {
+      this.clusterHealth = {
+        status: "offline",
+        healthyNodes,
+        totalNodes,
+        message: `${offlineNodes} retained node${offlineNodes === 1 ? "" : "s"} offline`,
+      };
+    } else {
+      this.clusterHealth = {
+        status: degradedNodes > 0 ? "degraded" : "unknown",
+        healthyNodes,
+        totalNodes,
+        message: `${healthyNodes}/${totalNodes} nodes have a current heartbeat`,
+      };
     }
   }
 
@@ -3608,6 +3730,9 @@ export const isConnected = () => appStore.isConnected;
 
 // Node identities (for OS version mismatch detection)
 export const nodeIdentities = () => appStore.nodeIdentities;
+export const nodeHealth = () => appStore.nodeHealth;
+export const clusterHealth = () => appStore.clusterHealth;
+export const clusterTransportHealth = () => appStore.clusterTransportHealth;
 
 // Thunderbolt & RDMA status
 export const nodeThunderbolt = () => appStore.nodeThunderbolt;

@@ -43,7 +43,26 @@ class _InterceptHandler(logging.Handler):
         logger.opt(depth=3, exception=record.exc_info).log(level, record.getMessage())
 
 
-def logger_setup(log_file: Path | None, verbosity: int = 0):
+def _add_file_sink(log_file: Path, verbosity: int) -> None:
+    rotate_once = _once_then_never()
+    logger.add(
+        log_file,
+        format="[ {time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} ] {message}",
+        level="DEBUG" if verbosity > 0 else "INFO",
+        colorize=False,
+        enqueue=True,
+        rotation=lambda _, __: next(rotate_once),
+        retention=_MAX_LOG_ARCHIVES,
+        compression=_zstd_compress,
+    )
+
+
+def logger_setup(
+    log_file: Path | None,
+    verbosity: int = 0,
+    *,
+    process_log_file: Path | None = None,
+):
     """Set up logging for this process - formatting, file handles, verbosity and output"""
 
     logging.getLogger("exo_rs").setLevel(logging.INFO)
@@ -73,17 +92,9 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
             enqueue=True,
         )
     if log_file:
-        rotate_once = _once_then_never()
-        logger.add(
-            log_file,
-            format="[ {time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} ] {message}",
-            level="DEBUG" if verbosity > 0 else "INFO",
-            colorize=False,
-            enqueue=True,
-            rotation=lambda _, __: next(rotate_once),
-            retention=_MAX_LOG_ARCHIVES,
-            compression=_zstd_compress,
-        )
+        _add_file_sink(log_file, verbosity)
+    if process_log_file is not None and process_log_file != log_file:
+        _add_file_sink(process_log_file, verbosity)
 
 
 def logger_cleanup():

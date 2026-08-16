@@ -57,6 +57,7 @@ class Election:
         command_receiver: Receiver[ForwarderCommand],
         is_candidate: bool = True,
         seniority: int = 0,
+        peer_expiry_grace_seconds: float = 0.0,
     ):
         # If we aren't a candidate, simply don't increment seniority.
         # For reference: This node can be elected master if all nodes are not master candidates
@@ -65,6 +66,7 @@ class Election:
         self.clock = 0
         self.node_id = node_id
         self.commands_seen = 0
+        self.peer_expiry_grace_seconds = max(0.0, peer_expiry_grace_seconds)
         # Every node spawns as master
         self.current_session: SessionId = SessionId(
             master_node_id=node_id, election_clock=0
@@ -162,9 +164,39 @@ class Election:
                 # Delay after connection message for time to symmetrically setup
                 await anyio.sleep(0.2)
                 rest = connection_messages.collect()
+                updates = [first, *rest]
+
+                # Zenoh liveliness can briefly report a peer as expired while
+                # its data path is still usable. Re-electing immediately tears
+                # down every runner, including active distributed inference.
+                # Debounce an expiry and consume a matching rediscovery without
+                # changing the current session.
+                expired_peer = next(
+                    (update.peer_id for update in reversed(updates) if not update.connected),
+                    None,
+                )
+                if expired_peer is not None and self.peer_expiry_grace_seconds > 0:
+                    logger.info(
+                        f"Peer expired; waiting "
+                        f"{self.peer_expiry_grace_seconds:.1f}s before "
+                        f"starting an election"
+                    )
+                    await anyio.sleep(self.peer_expiry_grace_seconds)
+                    updates.extend(connection_messages.collect())
+                    matching_updates = [
+                        update
+                        for update in updates
+                        if update.peer_id == expired_peer
+                    ]
+                    if matching_updates[-1].connected:
+                        logger.info(
+                            "Peer rediscovered during expiry grace period; "
+                            "keeping the current master session"
+                        )
+                        continue
 
                 logger.debug(
-                    f"Connection messages received: {first} followed by {rest}"
+                    f"Connection messages received: {updates}"
                 )
                 logger.debug(f"Current clock: {self.clock}")
                 # These messages are strictly peer to peer

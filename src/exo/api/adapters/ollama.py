@@ -169,6 +169,7 @@ def ollama_request_to_text_generation(
         top_p=options.top_p if options else None,
         top_k=options.top_k if options else None,
         stop=options.stop if options else None,
+        response_format=request.format,
         seed=options.seed if options else None,
         stream=request.stream,
         tools=request.tools,
@@ -265,6 +266,7 @@ async def generate_ollama_chat_stream(
 
 async def collect_ollama_chat_response(
     _command_id: CommandId,
+    requested_model: str,
     chunk_stream: AsyncGenerator[
         ErrorChunk | ToolCallChunk | TokenChunk | PrefillProgressChunk, None
     ],
@@ -277,8 +279,9 @@ async def collect_ollama_chat_response(
     text_parts: list[str] = []
     thinking_parts: list[str] = []
     tool_calls: list[OllamaToolCall] = []
-    model: str | None = None
+    model = requested_model
     finish_reason: str | None = None
+    error_message: str | None = None
     prompt_eval_count: int | None = None
     eval_count: int | None = None
 
@@ -288,11 +291,13 @@ async def collect_ollama_chat_response(
                 continue
 
             case ErrorChunk():
-                raise ValueError(chunk.error_message or "Internal server error")
+                model = str(chunk.model)
+                error_message = chunk.error_message or "Internal server error"
+                finish_reason = "error"
+                break
 
             case TokenChunk():
-                if model is None:
-                    model = str(chunk.model)
+                model = str(chunk.model)
                 if chunk.is_thinking:
                     thinking_parts.append(chunk.text)
                 else:
@@ -302,15 +307,21 @@ async def collect_ollama_chat_response(
                     prompt_eval_count, eval_count = _get_usage(chunk)
 
             case ToolCallChunk():
-                if model is None:
-                    model = str(chunk.model)
+                model = str(chunk.model)
                 tool_calls.extend(_build_tool_calls(chunk))
                 finish_reason = chunk.finish_reason
                 prompt_eval_count, eval_count = _get_usage(chunk)
 
     combined_text = "".join(text_parts)
     combined_thinking = "".join(thinking_parts) if thinking_parts else None
-    assert model is not None
+    if error_message is not None:
+        combined_text = error_message
+    elif not combined_text and not combined_thinking and not tool_calls:
+        combined_text = (
+            "EXO generation ended before the runner produced a response. "
+            "Check the runner logs and relaunch the model instance."
+        )
+        finish_reason = "error"
 
     yield OllamaChatResponse(
         model=model,
@@ -358,6 +369,7 @@ def ollama_generate_request_to_text_generation(
         top_p=options.top_p if options else None,
         top_k=options.top_k if options else None,
         stop=options.stop if options else None,
+        response_format=request.format,
         seed=options.seed if options else None,
         stream=request.stream,
         enable_thinking=request.think,

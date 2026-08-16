@@ -12,6 +12,8 @@ from exo.worker.engines.mlx.auto_parallel import (
     CustomMlxLayer,
     PipelineFirstLayer,
     PipelineLastLayer,
+    gemma3_cache_roles,
+    patch_layer_aligned_cache,
     patch_pipeline_model,
 )
 from exo.worker.tests.unittests.test_mlx.conftest import MockLayer
@@ -144,3 +146,45 @@ def test_composed_call_works() -> None:
             )
     finally:
         os.unlink(hostfile_path)
+
+
+def test_layer_aligned_cache_is_sliced_to_pipeline_shard() -> None:
+    class Model(mlx_nn.Module):
+        def make_cache(self) -> list[int]:
+            return list(range(6))
+
+    model = Model()
+    patch_layer_aligned_cache(model, 6, 2, 5)
+
+    assert model.make_cache() == [2, 3, 4]
+
+
+def test_non_layer_aligned_cache_is_not_sliced() -> None:
+    class Model(mlx_nn.Module):
+        def make_cache(self) -> list[int]:
+            return [10, 20]
+
+    model = Model()
+    patch_layer_aligned_cache(model, 6, 2, 5)
+
+    assert model.make_cache() == [10, 20]
+
+
+def test_gemma3_cache_roles_preserve_original_layer_phase() -> None:
+    class Attention:
+        def __init__(self, layer_idx: int) -> None:
+            self.layer_idx = layer_idx
+
+    class Layer:
+        def __init__(self, layer_idx: int) -> None:
+            self.self_attn = Attention(layer_idx)
+
+    # The second MedGemma pipeline shard starts at original layer 22. Local
+    # index 5 is layer 27 (sliding), not a global layer; original layers 23
+    # and 29 are the global-attention cache entries for a pattern of six.
+    layers = [Layer(index) for index in range(22, 34)]
+
+    sliding, global_ = gemma3_cache_roles(layers, sliding_window_pattern=6)  # type: ignore[arg-type]
+
+    assert sliding == 0
+    assert global_ == 1

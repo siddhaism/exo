@@ -8,6 +8,7 @@ from loguru import logger
 
 from exo.api.types import ImageEditsTaskParams
 from exo.download.download_utils import is_read_only_model_dir, resolve_existing_model
+from exo.routing.connection_message import ConnectionMessage
 from exo.routing.event_router import (
     EventRouterBrokenResourceError,
     EventRouterClosedResourceError,
@@ -73,6 +74,7 @@ class Worker:
         # but I think it's the correct way to be thinking about commands
         command_sender: Sender[ForwarderCommand],
         download_command_sender: Sender[ForwarderDownloadCommand],
+        connection_message_receiver: Receiver[ConnectionMessage],
         api_port: int,
     ):
         self.node_id: NodeId = node_id
@@ -80,6 +82,7 @@ class Worker:
         self.event_sender = event_sender
         self.command_sender = command_sender
         self.download_command_sender = download_command_sender
+        self.connection_message_receiver = connection_message_receiver
         self.api_port = api_port
 
         self.state: State = State()
@@ -112,6 +115,7 @@ class Worker:
                 tg.start_soon(self.plan_step)
                 tg.start_soon(self._event_applier)
                 tg.start_soon(self._poll_connection_updates)
+                tg.start_soon(self._abort_on_peer_expiry)
                 tg.start_soon(self._reconcile_custom_cards)
         except* (EventRouterBrokenResourceError, EventRouterClosedResourceError):
             # Event router has been closed (try-star syntax handles error groups)
@@ -136,6 +140,35 @@ class Worker:
                         info=info,
                     )
                 )
+
+    async def _abort_on_peer_expiry(self) -> None:
+        with self.connection_message_receiver as messages:
+            async for message in messages:
+                if message.connected:
+                    continue
+                distributed_runners = [
+                    runner
+                    for runner in self.runners.values()
+                    if (
+                        len(
+                            runner.bound_instance.instance.shard_assignments.node_to_runner
+                        )
+                        > 1
+                        and message.peer_id
+                        in runner.bound_instance.instance.shard_assignments.node_to_runner
+                    )
+                ]
+                if not distributed_runners:
+                    continue
+                logger.error(
+                    f"Peer {message.peer_id} expired while distributed runners "
+                    "were active; aborting them immediately"
+                )
+                async with anyio.create_task_group() as task_group:
+                    for runner in distributed_runners:
+                        task_group.start_soon(
+                            runner.abort_for_peer_loss, str(message.peer_id)
+                        )
 
     async def _event_applier(self):
         with self.event_receiver as events:
@@ -280,17 +313,32 @@ class Worker:
                         )
                 case Shutdown(runner_id=runner_id):
                     runner = self.runners.pop(runner_id)
+                    terminal_status = TaskStatus.Complete
                     try:
                         with fail_after(3):
                             await runner.start_task(task)
                     except TimeoutError:
-                        await self.event_sender.send(
-                            TaskStatusUpdated(
-                                task_id=task.task_id, task_status=TaskStatus.TimedOut
-                            )
-                        )
+                        terminal_status = TaskStatus.TimedOut
                     finally:
                         runner.shutdown()
+                        # `start_task` returns as soon as the runner acknowledges,
+                        # which it does before closing the engine. If close()
+                        # then blocks — tearing down an MLX distributed group
+                        # while the peer tears down its own can block — the
+                        # runner never publishes Complete and the task stays
+                        # Running in the replicated state forever. The
+                        # post-generation JACCL recycle refuses to drain an
+                        # instance that still has in-flight tasks, so the model
+                        # became permanently unservable and every later request
+                        # was rejected. `shutdown()` above has already torn the
+                        # process down, so the shutdown is a fact by this point:
+                        # record it once, here, rather than relying on the runner
+                        # surviving long enough to report it.
+                        await self.event_sender.send(
+                            TaskStatusUpdated(
+                                task_id=task.task_id, task_status=terminal_status
+                            )
+                        )
                 case CancelTask(
                     cancelled_task_id=cancelled_task_id, runner_id=runner_id
                 ):

@@ -427,47 +427,67 @@ class KVPrefixCache:
         return match_length
 
     def _evict_if_needed(self):
-        """Evict least recently used entries while memory usage is high."""
-        if len(self.caches) == 0:
-            return
+        """Evict least recently used entries while memory usage is high.
 
+        Every rank must execute the same number of collectives here.
+        `get_memory_used_percentage` performs an all_gather, and the previous
+        version both returned early when its own cache was empty and relied on
+        Python short-circuiting `len(self.caches) > 0 and ...`. Two ranks holding
+        different numbers of cache entries therefore called all_gather a
+        different number of times, which deadlocks the group permanently: the
+        rank that keeps polling blocks in the collective while its peer walks on
+        into prefill and blocks waiting for activations. The symptom is a prefill
+        that never advances past zero tokens, with no error on either side.
+
+        So the loop is driven entirely by agreed values: cluster-wide pressure
+        and the largest entry count on any rank. A rank with nothing left to
+        evict keeps iterating in lock-step with peers that still have entries,
+        and the loop ends when no rank has any.
+        """
         evicted_any = False
-        # Evict LRU entries until below threshold
-        while (
-            len(self.caches) > 0
-            and self.get_memory_used_percentage() > _MEMORY_THRESHOLD
-        ):
-            lru_index = self._last_used.index(min(self._last_used))
-            evicted_tokens = len(self.prompts[lru_index])
-            self.prompts.pop(lru_index)
-            self.caches.pop(lru_index)
-            self._snapshots.pop(lru_index)
-            self._media_regions.pop(lru_index)
-            self._last_used.pop(lru_index)
-            self.prefill_tps.pop(lru_index)
+        while True:
+            pressure, max_entries = self._pressure_and_max_entries()
+            if max_entries == 0 or pressure <= _MEMORY_THRESHOLD:
+                break
 
-            evicted_any = True
-            logger.info(
-                f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
-            )
+            if self.caches:
+                lru_index = self._last_used.index(min(self._last_used))
+                evicted_tokens = len(self.prompts[lru_index])
+                self.prompts.pop(lru_index)
+                self.caches.pop(lru_index)
+                self._snapshots.pop(lru_index)
+                self._media_regions.pop(lru_index)
+                self._last_used.pop(lru_index)
+                self.prefill_tps.pop(lru_index)
+
+                evicted_any = True
+                logger.info(
+                    f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
+                )
 
         if evicted_any:
             gc.collect()
             mx.clear_cache()
 
-    def get_memory_used_percentage(self) -> float:
-        local_pressure: float = get_memory_used_percentage()
+    def _pressure_and_max_entries(self) -> tuple[float, int]:
+        """Cluster-wide memory pressure and the largest entry count on any rank.
 
-        if self._group is None:
-            return local_pressure
-
-        all_pressure = mx.distributed.all_gather(
-            mx.array([local_pressure], dtype=mx.float32),
-            group=self._group,
+        Both travel in a single all_gather so every rank reaches identical loop
+        decisions. Gathering the entry count matters as much as the pressure —
+        without it a rank whose cache is already empty would stop calling the
+        collective while a peer kept polling.
+        """
+        local = mx.array(
+            [get_memory_used_percentage(), float(len(self.caches))], dtype=mx.float32
         )
-        # .item() evals.
-        max_pressure = float(mx.max(all_pressure).item())
-        return max_pressure
+        if self._group is None:
+            return float(local[0].item()), int(local[1].item())
+
+        gathered = mx.distributed.all_gather(local, group=self._group).reshape(-1, 2)
+        return float(mx.max(gathered[:, 0]).item()), int(mx.max(gathered[:, 1]).item())
+
+    def get_memory_used_percentage(self) -> float:
+        return self._pressure_and_max_entries()[0]
 
 
 def trim_cache(

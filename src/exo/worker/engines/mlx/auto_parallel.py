@@ -1,7 +1,9 @@
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
 from functools import partial
 from inspect import signature
+from itertools import count
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import mlx.core as mx
@@ -12,6 +14,7 @@ from mlx.nn.layers.distributed import (
     sum_gradients,
 )
 from mlx_lm.models.base import (
+    create_attention_mask,  # pyright: ignore[reportUnknownVariableType]
     scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import ArraysCache, KVCache
@@ -21,6 +24,7 @@ from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+from mlx_lm.models.gemma3_text import Gemma3Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
 from mlx_lm.models.glm4_moe import Model as Glm4MoeModel
 from mlx_lm.models.glm4_moe import MoE
@@ -70,12 +74,36 @@ if TYPE_CHECKING:
 
 
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
+_distributed_operation_sequence = count()
+
+
+def _eval_distributed_operation(
+    operation: str,
+    value: mx.array,
+    *,
+    rank: int,
+    peer: int | None = None,
+) -> mx.array:
+    sequence = next(_distributed_operation_sequence)
+    started = time.monotonic()
+    logger.info(
+        "MLX distributed operation begin "
+        f"sequence={sequence} operation={operation} rank={rank} "
+        f"peer={peer} shape={value.shape} dtype={value.dtype}"
+    )
+    mx.eval(value)
+    logger.info(
+        "MLX distributed operation end "
+        f"sequence={sequence} operation={operation} rank={rank} "
+        f"peer={peer} elapsed_seconds={time.monotonic() - started:.3f}"
+    )
+    return value
 
 
 def flush_prefill_sends() -> None:
     for output, dst, group in _pending_prefill_sends:
         sent = mx.distributed.send(output, dst, group=group)
-        mx.async_eval(sent)
+        _eval_distributed_operation("prefill_send", sent, rank=group.rank(), peer=dst)
     _pending_prefill_sends.clear()
 
 
@@ -135,7 +163,9 @@ class PipelineFirstLayer(CustomMlxLayer):
             # so that it stays on CPU, which does not have a timeout.
             mx.eval(x)
             x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
-            mx.eval(x)
+            _eval_distributed_operation(
+                "pipeline_recv", x, rank=self.r, peer=self.r - 1
+            )
         return self.original_layer(x, *args, **kwargs)
 
 
@@ -181,7 +211,12 @@ class PipelineLastLayer(CustomMlxLayer):
                 _cache = cache[0] if hasattr(cache, "caches") else cache  # type: ignore
                 if hasattr(_cache, "keys"):  # pyright: ignore[reportAny]
                     _cache.keys = mx.depends(_cache.keys, output)  # type: ignore
-            mx.eval(output)
+            _eval_distributed_operation(
+                "pipeline_send",
+                output,
+                rank=self.r,
+                peer=(self.r + 1) % self.s,
+            )
             if cache is not None and hasattr(_cache, "keys"):  # type: ignore
                 mx.eval(_cache.keys)  # type: ignore
 
@@ -189,7 +224,7 @@ class PipelineLastLayer(CustomMlxLayer):
             output = mx.distributed.all_gather(output, group=self.group)[
                 -output.shape[0] :
             ]
-            mx.eval(output)
+            _eval_distributed_operation("pipeline_all_gather", output, rank=self.r)
 
         return output
 
@@ -273,6 +308,109 @@ def _patch_hybrid_cache(
     model.make_cache = patched
 
 
+def patch_layer_aligned_cache(
+    model: nn.Module,
+    original_num_layers: int,
+    start_layer: int,
+    end_layer: int,
+) -> None:
+    """Slice caches when a model creates exactly one cache per original layer."""
+    untyped_make_cache = getattr(model, "make_cache", None)
+    if untyped_make_cache is None:
+        return
+    original_make_cache = cast(Callable[[], list[object]], untyped_make_cache)
+
+    def patched() -> list[object]:
+        caches = list(original_make_cache())
+        if len(caches) == original_num_layers:
+            return caches[start_layer:end_layer]
+        return caches
+
+    model.make_cache = patched
+
+
+def gemma3_cache_roles(
+    layers: list[_LayerCallable], sliding_window_pattern: int
+) -> tuple[int | None, int | None]:
+    """Find shard-local cache entries using each layer's original model index."""
+    sliding: int | None = None
+    global_: int | None = None
+    for index, layer in enumerate(layers):
+        layer_index = int(layer.self_attn.layer_idx)  # type: ignore[reportAttributeAccessIssue]
+        if layer_index % sliding_window_pattern == sliding_window_pattern - 1:
+            global_ = index if global_ is None else global_
+        else:
+            sliding = index if sliding is None else sliding
+    return sliding, global_
+
+
+def patch_gemma3_pipeline_masks(model: Gemma3Model) -> None:
+    """Preserve Gemma 3's global/sliding mask phase after pipeline slicing.
+
+    MLX-LM normally derives the attention type from the layer's position in the
+    complete model. Pipeline sharding makes ``enumerate(layers)`` start at zero
+    again, which can pair a global mask with a rotating cache. At the sliding
+    window boundary that produces a mask one token wider than the cached keys.
+    """
+    cls = model.__class__
+    if getattr(cls, "_exo_pipeline_masks_patched", False):
+        return
+
+    def patched_call(
+        self: Gemma3Model,
+        inputs: mx.array,
+        cache: list[object] | None = None,
+        input_embeddings: mx.array | None = None,
+    ) -> mx.array:
+        h: mx.array = (
+            input_embeddings
+            if input_embeddings is not None
+            else self.embed_tokens(inputs)
+        )
+        h *= mx.array(
+            self.args.hidden_size**0.5,  # pyright: ignore[reportAny]
+            mx.bfloat16,
+        ).astype(h.dtype)
+
+        layers = cast(list[_LayerCallable], self.layers)
+        cache_entries: list[object | None] = (
+            [None] * len(layers) if cache is None else cache
+        )
+        sliding_index, global_index = gemma3_cache_roles(
+            layers, self.sliding_window_pattern
+        )
+        make_mask = cast(
+            Callable[..., mx.array | Literal["causal"] | None],
+            create_attention_mask,
+        )
+        global_mask: mx.array | Literal["causal"] | None = (
+            make_mask(h, cache_entries[global_index])
+            if global_index is not None
+            else None
+        )
+        sliding_mask: mx.array | Literal["causal"] | None = (
+            make_mask(
+                h,
+                cache_entries[sliding_index],
+                window_size=self.window_size,
+            )
+            if sliding_index is not None
+            else None
+        )
+
+        for layer, layer_cache in zip(layers, cache_entries, strict=True):
+            layer_index = int(layer.self_attn.layer_idx)  # type: ignore[reportAttributeAccessIssue]
+            is_global = (
+                layer_index % self.sliding_window_pattern
+                == self.sliding_window_pattern - 1
+            )
+            h = layer(h, global_mask if is_global else sliding_mask, layer_cache)
+        return cast(mx.array, self.norm(h))
+
+    cls.__call__ = patched_call
+    cls._exo_pipeline_masks_patched = True  # pyright: ignore[reportAttributeAccessIssue]
+
+
 def pipeline_auto_parallel(
     model: nn.Module,
     group: mx.distributed.Group,
@@ -289,6 +427,7 @@ def pipeline_auto_parallel(
     inner_model_instance: nn.Module = get_inner_model(model)
 
     layers = get_layers(inner_model_instance)
+    original_num_layers = len(layers)
 
     start_layer, end_layer = model_shard_meta.start_layer, model_shard_meta.end_layer
     device_rank, world_size = model_shard_meta.device_rank, model_shard_meta.world_size
@@ -385,6 +524,16 @@ def pipeline_auto_parallel(
                 ssm_idx=inner_model_instance.ssm_idx,
                 has_linear=has_mamba,
             )
+
+    if isinstance(inner_model_instance, Gemma3Model):
+        patch_gemma3_pipeline_masks(inner_model_instance)
+
+    patch_layer_aligned_cache(
+        model,
+        original_num_layers=original_num_layers,
+        start_layer=start_layer,
+        end_layer=end_layer,
+    )
 
     _set_layers(model, layers)
 

@@ -65,6 +65,8 @@
     nodeThunderboltBridge,
     nodeIdentities,
     isConnected,
+    clusterHealth,
+    clusterTransportHealth,
     type DownloadProgress,
     type PlacementPreview,
   } from "$lib/stores/app.svelte";
@@ -97,6 +99,15 @@
   const tbIdentifiers = $derived(nodeThunderbolt());
   const rdmaCtlData = $derived(nodeRdmaCtl());
   const nodeFilter = $derived(previewNodeFilter());
+  const health = $derived(clusterHealth());
+  const backendConnected = $derived(isConnected());
+  const transportHealth = $derived(clusterTransportHealth());
+  const connectedTransportPeers = $derived.by(
+    () =>
+      Object.values(transportHealth.controlPlane?.peers ?? {}).filter(
+        (peer) => peer.connected,
+      ).length,
+  );
 
   // Aggregate active download progress across all instances for header indicator
   const activeDownloadSummary = $derived.by(() => {
@@ -4885,6 +4896,59 @@
           <div
             class="flex-1 relative bg-exo-dark-gray/40 mx-4 mb-4 rounded-lg overflow-hidden"
           >
+            <div
+              class="absolute top-3 left-3 z-20 flex items-center gap-2 rounded-md border px-3 py-2 bg-black/75 backdrop-blur-sm {backendConnected &&
+              health.status === 'healthy'
+                ? 'border-green-500/40 text-green-300'
+                : backendConnected && health.status === 'degraded'
+                  ? 'border-yellow-500/40 text-yellow-300'
+                  : 'border-red-500/40 text-red-300'}"
+              role="status"
+              aria-live="polite"
+            >
+              <span
+                class="h-2.5 w-2.5 rounded-full {backendConnected &&
+                health.status === 'healthy'
+                  ? 'bg-green-400'
+                  : backendConnected && health.status === 'degraded'
+                    ? 'bg-yellow-400 animate-pulse'
+                    : 'bg-red-400 animate-pulse'}"
+              ></span>
+              <div class="font-mono">
+                <div class="text-[11px] font-semibold tracking-wider uppercase">
+                  {backendConnected
+                    ? `Cluster ${health.status}`
+                    : "Backend unreachable"}
+                </div>
+                <div class="text-[10px] opacity-75">
+                  {backendConnected
+                    ? `${health.message} · ${health.healthyNodes}/${health.totalNodes} live`
+                    : "Dashboard state is stale"}
+                </div>
+                {#if backendConnected}
+                  <div class="text-[10px] opacity-75">
+                    Control peers: {connectedTransportPeers} · Data plane: {transportHealth
+                      .dataPlane?.ready
+                      ? "ready"
+                      : "not ready"} · Reconnects: {transportHealth.controlPlane
+                      ?.reconnectCount ?? 0}
+                  </div>
+                  {#if transportHealth.controlPlane?.lastError}
+                    <div class="text-[10px] text-red-300">
+                      {transportHealth.controlPlane.lastError}
+                    </div>
+                  {/if}
+                  <a
+                    href="/v1/diagnostics/bundle"
+                    download
+                    class="mt-1 inline-block text-[10px] underline underline-offset-2 opacity-80 hover:opacity-100"
+                  >
+                    Download diagnostics
+                  </a>
+                {/if}
+              </div>
+            </div>
+
             <!-- The main topology graph - full container -->
             <TopologyGraph
               class="w-full h-full"

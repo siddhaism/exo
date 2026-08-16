@@ -35,8 +35,8 @@ pub enum ToSwarm {
 #[derive(Debug)]
 pub enum FromSwarm {
     Message { topic: String, data: Vec<u8> },
-    Discovered {},
-    Expired {},
+    Discovered { peer_id: String },
+    Expired { peer_id: String },
 }
 
 pub type Topics = HashMap<String, (Subscriber<()>, Publisher<'static>)>;
@@ -74,11 +74,15 @@ impl Swarm {
                             yield match token.kind() {
                                 SampleKind::Put => {
                                     log::info!("discovered: {zid:?}");
-                                    FromSwarm::Discovered {}
+                                    FromSwarm::Discovered {
+                                        peer_id: zid.unwrap_or_default().to_owned(),
+                                    }
                                 }
                                 SampleKind::Delete => {
                                     log::info!("expired: {zid:?}");
-                                    FromSwarm::Expired {}
+                                    FromSwarm::Expired {
+                                        peer_id: zid.unwrap_or_default().to_owned(),
+                                    }
                                 }
                             }
                         }
@@ -198,9 +202,18 @@ pub async fn create_swarm(
     from_client: mpsc::Receiver<ToSwarm>,
     listen_port: u16,
     discovery_service_port: u16,
+    discovery_interface: Option<String>,
+    bootstrap_peers: Vec<String>,
 ) -> Result<Swarm> {
-    let cfg = crate::cfg(identity, listen_port)?;
-    let session = crate::open(cfg, namespace, listen_port, discovery_service_port).await?;
+    let cfg = crate::cfg(identity, listen_port, &bootstrap_peers)?;
+    let session = crate::open(
+        cfg,
+        namespace,
+        listen_port,
+        discovery_service_port,
+        discovery_interface,
+    )
+    .await?;
     Ok(Swarm {
         session,
         from_client,

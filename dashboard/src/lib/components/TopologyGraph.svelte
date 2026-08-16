@@ -8,6 +8,7 @@
     nodeThunderboltBridge,
     nodeRdmaCtl,
     nodeIdentities,
+    nodeHealth,
     type NodeInfo,
   } from "$lib/stores/app.svelte";
 
@@ -35,6 +36,14 @@
   const tbBridgeData = $derived(nodeThunderboltBridge());
   const rdmaCtlData = $derived(nodeRdmaCtl());
   const identitiesData = $derived(nodeIdentities());
+  const healthData = $derived(nodeHealth());
+
+  function formatHeartbeatAge(ageMs: number | null): string {
+    if (ageMs === null) return "heartbeat unknown";
+    if (ageMs < 1_000) return "heartbeat now";
+    if (ageMs < 60_000) return `heartbeat ${Math.floor(ageMs / 1_000)}s ago`;
+    return `heartbeat ${Math.floor(ageMs / 60_000)}m ago`;
+  }
 
   function getNodeLabel(nodeId: string): string {
     const node = data?.nodes?.[nodeId];
@@ -523,6 +532,19 @@
       const macmon = node.macmon_info;
       const modelId = node.system_info?.model_id || "Unknown";
       const friendlyName = node.friendly_name || modelId;
+      const health = healthData[nodeInfo.id] ?? {
+        status: "unknown",
+        lastSeen: null,
+        ageMs: null,
+      };
+      const healthColor =
+        health.status === "healthy"
+          ? "#4ade80"
+          : health.status === "degraded"
+            ? "#facc15"
+            : health.status === "offline"
+              ? "#f87171"
+              : "#9ca3af";
 
       let ramUsagePercent = 0;
       let gpuTemp = NaN;
@@ -595,7 +617,10 @@
         .append("g")
         .attr("class", "graph-node")
         .style("cursor", onNodeClick ? "pointer" : "default")
-        .style("opacity", isFilteredOut ? 0.5 : 1);
+        .style(
+          "opacity",
+          health.status === "offline" ? 0.35 : isFilteredOut ? 0.5 : 1,
+        );
 
       // Add click and hover handlers - hover just updates state, styling is applied during render
       nodeG
@@ -620,7 +645,7 @@
       nodeG
         .append("title")
         .text(
-          `${friendlyName}\nID: ${nodeInfo.id.slice(-8)}\nMemory: ${formatBytes(ramUsed)}/${formatBytes(ramTotal)}`,
+          `${friendlyName}\nStatus: ${health.status} (${formatHeartbeatAge(health.ageMs)})\nID: ${nodeInfo.id.slice(-8)}\nMemory: ${formatBytes(ramUsed)}/${formatBytes(ramTotal)}`,
         );
 
       if (modelLower === "mac studio") {
@@ -924,6 +949,17 @@
           .attr("stroke-width", strokeWidth);
       }
 
+      // Live heartbeat status. This is intentionally drawn after the device so
+      // a retained/offline topology member can never look connected.
+      nodeG
+        .append("circle")
+        .attr("cx", nodeInfo.x - iconBaseWidth / 2)
+        .attr("cy", nodeInfo.y - iconBaseHeight / 2)
+        .attr("r", Math.max(4, nodeRadius * 0.055))
+        .attr("fill", healthColor)
+        .attr("stroke", "#111827")
+        .attr("stroke-width", 2);
+
       // --- Vertical GPU Bar (right side of icon) ---
       // Show in both full mode and minimized mode (scaled appropriately)
       if (showFullLabels || isMinimized) {
@@ -1060,6 +1096,17 @@
           .append("tspan")
           .attr("fill", "rgba(179,179,179,0.7)")
           .text(` (${ramUsagePercent.toFixed(0)}%)`);
+        nodeG
+          .append("text")
+          .attr("x", nodeInfo.x)
+          .attr("y", infoY + fontSize * 1.2)
+          .attr("text-anchor", "middle")
+          .attr("fill", healthColor)
+          .attr("font-size", fontSize * 0.72)
+          .attr("font-family", "SF Mono, Monaco, monospace")
+          .text(
+            `${health.status.toUpperCase()} · ${formatHeartbeatAge(health.ageMs)}`,
+          );
       } else if (showCompactLabels) {
         // COMPACT MODE: Just name and basic info (4+ nodes)
         const fontSize = Math.max(7, nodeRadius * 0.11);
@@ -1206,6 +1253,7 @@
     const _hoveredNodeId = hoveredNodeId;
     const _filteredNodes = filteredNodes;
     const _highlightedNodes = highlightedNodes;
+    const _healthData = healthData;
     if (_data) {
       renderGraph();
     }

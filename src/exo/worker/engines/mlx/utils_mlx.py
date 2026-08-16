@@ -142,9 +142,56 @@ def mlx_distributed_init(
                 os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
                 group = mx.distributed.init(backend="jaccl", strict=True)
 
+        _probe_distributed_data_plane(group)
         logger.info(f"Rank {rank} mlx distributed initialization complete")
 
         return group
+
+
+def _probe_distributed_data_plane(group: mx.distributed.Group) -> None:
+    """Exercise the same collective and point-to-point paths used by inference."""
+    if os.environ.get("EXO_MLX_DATA_PLANE_PROBE", "1") == "0":
+        logger.warning("MLX distributed data-plane readiness probe disabled")
+        return
+
+    rank = group.rank()
+    if group.size() != 2:
+        raise RuntimeError(
+            f"data-plane readiness probe currently requires 2 ranks, got {group.size()}"
+        )
+
+    started = time.monotonic()
+    value = mx.array([rank + 1], dtype=mx.int32)
+    collective = mx.distributed.all_sum(value, group=group)
+    mx.eval(collective)
+    collective_value = int(collective.item())
+    if collective_value != 3:
+        raise RuntimeError(
+            "distributed all-sum readiness probe returned "
+            f"{collective_value}, expected 3"
+        )
+
+    repetitions = max(1, int(os.getenv("EXO_MLX_DATA_PLANE_PROBE_REPETITIONS", "8")))
+    payload = mx.full((1, 512, 5376), rank + 11, dtype=mx.bfloat16)
+    for _ in range(repetitions):
+        if rank == 0:
+            first = mx.distributed.send(payload, 1, group=group)
+        else:
+            first = mx.distributed.recv_like(payload, 0, group=group)
+        mx.eval(first)
+
+        if rank == 1:
+            second = mx.distributed.send(payload, 0, group=group)
+        else:
+            second = mx.distributed.recv_like(payload, 1, group=group)
+        mx.eval(second)
+
+    logger.info(
+        "MLX distributed data-plane readiness probe passed "
+        f"rank={rank} bytes_per_transfer={payload.nbytes} "
+        f"repetitions={repetitions} "
+        f"elapsed_seconds={time.monotonic() - started:.3f}"
+    )
 
 
 def initialize_mlx(

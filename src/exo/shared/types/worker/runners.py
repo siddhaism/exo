@@ -18,6 +18,10 @@ class RunnerError(Exception):
 
 
 class BaseRunnerStatus(TaggedModel):
+    runtime_build_id: str | None = None
+    data_plane_generation: str | None = None
+    active_manifest_hash: str | None = None
+
     def is_running(self):
         return isinstance(self, RunnerRunning)
 

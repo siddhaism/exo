@@ -118,6 +118,7 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     use_prefix_cache: bool = False
     top_k: int | None = None
     stop: str | list[str] | None = None
+    response_format: Literal["json"] | dict[str, Any] | None = None
     seed: int | None = None
     chat_template_messages: list[dict[str, ChatTemplateValue]] | None = None
     reasoning_effort: ReasoningEffort | None = None

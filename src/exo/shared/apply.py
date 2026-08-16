@@ -219,8 +219,24 @@ def apply_instance_created(event: InstanceCreated, state: State) -> State:
 
 
 def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
+    deleted_instance = state.instances.get(event.instance_id)
+    deleted_runner_ids: set[RunnerId] = (
+        set(deleted_instance.shard_assignments.runner_to_shard)
+        if deleted_instance is not None
+        else set()
+    )
     new_instances: Mapping[InstanceId, Instance] = {
         iid: inst for iid, inst in state.instances.items() if iid != event.instance_id
+    }
+    new_runners = {
+        runner_id: status
+        for runner_id, status in state.runners.items()
+        if runner_id not in deleted_runner_ids
+    }
+    new_prefill_server_ports = {
+        runner_id: port
+        for runner_id, port in state.prefill_server_ports.items()
+        if runner_id not in deleted_runner_ids
     }
     new_links: dict[InstanceLinkId, InstanceLink] = {}
     for link_id, link in state.instance_links.items():
@@ -237,7 +253,12 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
                 update={"prefill_instances": prefill, "decode_instances": decode}
             )
     return state.model_copy(
-        update={"instances": new_instances, "instance_links": new_links}
+        update={
+            "instances": new_instances,
+            "instance_links": new_links,
+            "runners": new_runners,
+            "prefill_server_ports": new_prefill_server_ports,
+        }
     )
 
 

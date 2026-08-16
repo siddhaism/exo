@@ -1,3 +1,5 @@
+import hashlib
+import os
 import queue
 import threading
 import time
@@ -189,6 +191,16 @@ class Runner:
             req.done.set()
 
     def update_status(self, status: RunnerStatus):
+        runtime_build_id = os.environ.get("EXO_MLX_BUILD_ID")
+        if runtime_build_id is not None:
+            status = status.model_copy(
+                update={
+                    "runtime_build_id": runtime_build_id,
+                    "data_plane_generation": str(
+                        self.bound_instance.instance.instance_id
+                    ),
+                }
+            )
         self.current_status = status
         self.event_sender.send(
             RunnerStatusUpdated(
@@ -330,8 +342,17 @@ class Runner:
         assert isinstance(self.current_status, RunnerReady)
         assert isinstance(self.generator, Engine)
 
-        logger.info(f"received chat request: {starting_task}")
-        self.update_status(RunnerRunning())
+        manifest_json = starting_task.model_dump_json(
+            by_alias=True, exclude={"task_status"}
+        )
+        manifest_hash = hashlib.sha256(manifest_json.encode()).hexdigest()
+        logger.info(
+            "received generation request "
+            f"task_id={starting_task.task_id} manifest_hash={manifest_hash} "
+            f"runtime_build_id={os.environ.get('EXO_MLX_BUILD_ID')} "
+            f"data_plane_generation={self.bound_instance.instance.instance_id}"
+        )
+        self.update_status(RunnerRunning(active_manifest_hash=manifest_hash))
         logger.info("runner running")
         self.acknowledge_task(starting_task)
         self.seen.add(starting_task.task_id)

@@ -279,6 +279,57 @@ def test_get_shard_assignments(
     )
 
 
+def test_two_node_pipeline_balances_when_both_halves_fit():
+    node_a_id = NodeId()
+    node_b_id = NodeId()
+    topology = Topology()
+    topology.add_node(node_a_id)
+    topology.add_node(node_b_id)
+    topology.add_connection(
+        Connection(
+            source=node_a_id,
+            sink=node_b_id,
+            edge=create_socket_connection(1),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b_id,
+            sink=node_a_id,
+            edge=create_socket_connection(2),
+        )
+    )
+    node_memory = {
+        node_a_id: create_node_memory(2000 * 1024),
+        node_b_id: create_node_memory(1000 * 1024),
+    }
+    model_card = ModelCard(
+        model_id=ModelId("test-model"),
+        n_layers=62,
+        storage_size=Memory.from_kb(1000),
+        hidden_size=1000,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+    )
+    selected_cycle = next(cycle for cycle in topology.get_cycles() if len(cycle) == 2)
+
+    assignments = get_shard_assignments_for_pipeline_parallel(
+        model_card, selected_cycle, node_memory
+    )
+
+    assigned_layers = [
+        assignments.runner_to_shard[
+            assignments.node_to_runner[node_id]
+        ].end_layer
+        - assignments.runner_to_shard[
+            assignments.node_to_runner[node_id]
+        ].start_layer
+        for node_id in selected_cycle
+    ]
+    assert assigned_layers == [31, 31]
+
+
 def test_get_mlx_jaccl_coordinators():
     # arrange
     node_a_id = NodeId()

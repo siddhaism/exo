@@ -22,7 +22,12 @@ from exo.download.impl_shard_downloader import exo_shard_downloader
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_zid
-from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_LOG, EXO_PID_FILE
+from exo.shared.constants import (
+    EXO_DEFAULT_MODELS_DIR,
+    EXO_LOG,
+    EXO_LOG_DIR,
+    EXO_PID_FILE,
+)
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.types.common import NodeId, SessionId
@@ -58,6 +63,8 @@ class Node:
             namespace=args.namespace,
             listen_port=args.zenoh_port,
             discovery_service_port=args.discovery_port,
+            discovery_interface=args.discovery_interface,
+            bootstrap_peers=args.bootstrap_peers,
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
@@ -97,6 +104,7 @@ class Node:
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
                 election_receiver=router.receiver(topics.ELECTION_MESSAGES),
+                network_health_provider=router.health_snapshot,
             )
         else:
             api = None
@@ -108,6 +116,7 @@ class Node:
                 event_sender=event_router.sender(),
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
+                connection_message_receiver=router.receiver(topics.CONNECTION_MESSAGES),
                 api_port=args.api_port,
             )
         else:
@@ -129,6 +138,7 @@ class Node:
             node_id,
             # If someone manages to assemble 1 MILLION devices into an exo cluster then. well done. good job champ.
             seniority=1_000_000 if args.force_master else 0,
+            peer_expiry_grace_seconds=args.peer_expiry_grace,
             # nb: this DOES feedback right now. i have thoughts on how to address this,
             # but ultimately it seems not worth the complexity
             election_message_sender=router.sender(topics.ELECTION_MESSAGES),
@@ -264,6 +274,9 @@ class Node:
                             download_command_sender=self.router.sender(
                                 topics.DOWNLOAD_COMMANDS
                             ),
+                            connection_message_receiver=self.router.receiver(
+                                topics.CONNECTION_MESSAGES
+                            ),
                             api_port=self._api_port,
                         )
                         self._tg.start_soon(self.worker.run)
@@ -337,20 +350,32 @@ def main_inner(args: "Args"):
     mp.set_start_method("spawn", force=True)
 
     # TODO: Refactor the current verbosity system
-    logger_setup(EXO_LOG, args.verbosity)
+    process_log = EXO_LOG_DIR / f"exo-main-{os.getpid()}.log"
+    logger_setup(EXO_LOG, args.verbosity, process_log_file=process_log)
 
     logger.info(f"pid = {os.getpid()}")
+    logger.info(f"Process-specific log: {process_log}")
     if os.getenv("EXO_LIBP2P_NAMESPACE"):
         raise ValueError(
             "EXO_LIBP2P_NAMESPACE has been removed - use EXO_ZENOH_NAMESPACE instead"
         )
     logger.info(f"EXO_ZENOH_NAMESPACE: {os.getenv('EXO_ZENOH_NAMESPACE')}")
+    logger.info(
+        "Discovery interfaces: "
+        + (args.discovery_interface or "all multicast-capable interfaces")
+    )
+    if args.peer_expiry_grace > 60:
+        logger.warning(
+            f"Peer expiry grace {args.peer_expiry_grace:g}s is unsafe for "
+            "distributed inference; capping it at 60s"
+        )
+        args = args.model_copy(update={"peer_expiry_grace": 60.0})
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
     if args.bootstrap_peers:
-        raise ValueError("Bootstrap peers has been temporarily removed")
+        logger.info(f"Fixed Zenoh peers: {args.bootstrap_peers}")
 
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
@@ -393,6 +418,8 @@ class Args(FrozenModel):
     namespace: str
     zenoh_port: int
     discovery_port: int
+    discovery_interface: str | None = None
+    peer_expiry_grace: float = 30.0
 
     @classmethod
     def parse(cls) -> Self:
@@ -462,7 +489,10 @@ class Args(FrozenModel):
             if os.getenv("EXO_BOOTSTRAP_PEERS")
             else [],
             dest="bootstrap_peers",
-            help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
+            help=(
+                "Comma-separated Zenoh endpoints to dial continuously, for example "
+                "tcp/[fe80::1%%en0]:52414 (env: EXO_BOOTSTRAP_PEERS)"
+            ),
         )
         parser.add_argument(
             "--namespace",
@@ -484,6 +514,26 @@ class Args(FrozenModel):
             default=52413,
             dest="discovery_port",
             help="Fixed UDP port for the discovery service.",
+        )
+        parser.add_argument(
+            "--discovery-interface",
+            type=str,
+            default=os.getenv("EXO_DISCOVERY_INTERFACE") or None,
+            dest="discovery_interface",
+            help=(
+                "Restrict peer discovery to a network interface such as en0 "
+                "(env: EXO_DISCOVERY_INTERFACE)."
+            ),
+        )
+        parser.add_argument(
+            "--peer-expiry-grace",
+            type=float,
+            default=float(os.getenv("EXO_PEER_EXPIRY_GRACE", "30")),
+            dest="peer_expiry_grace",
+            help=(
+                "Seconds to wait for an expired peer to reappear before "
+                "starting a master election (env: EXO_PEER_EXPIRY_GRACE)."
+            ),
         )
         fast_synch_group = parser.add_mutually_exclusive_group()
         fast_synch_group.add_argument(

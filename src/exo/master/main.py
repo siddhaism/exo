@@ -16,7 +16,13 @@ from exo.routing.event_router import (
     EventRouterClosedResourceError,
 )
 from exo.shared.apply import apply
-from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
+from exo.shared.constants import (
+    EXO_DISTRIBUTED_RECYCLE_COOLDOWN_SECONDS,
+    EXO_EVENT_LOG_DIR,
+    EXO_RECYCLE_DISTRIBUTED_MLX_AFTER_GENERATION,
+    EXO_TRACING_ENABLED,
+)
+from exo.shared.types.chunks import ErrorChunk
 from exo.shared.types.commands import (
     AddCustomModelCard,
     CreateInstance,
@@ -38,12 +44,14 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    ChunkGenerated,
     CustomModelCardAdded,
     CustomModelCardDeleted,
     Event,
     GlobalForwarderEvent,
     IndexedEvent,
     InputChunkReceived,
+    InstanceCreated,
     InstanceDeleted,
     InstanceLinkCreated,
     InstanceLinkDeleted,
@@ -72,11 +80,45 @@ from exo.shared.types.tasks import (
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
-from exo.shared.types.worker.instances import InstanceId
+from exo.shared.types.worker.instances import (
+    Instance,
+    InstanceId,
+    InstanceMeta,
+    MlxJacclInstance,
+)
+from exo.shared.types.worker.runners import RunnerFailed
+from exo.shared.types.worker.shards import (
+    PipelineShardMetadata,
+    Sharding,
+    TensorShardMetadata,
+)
 from exo.utils.channels import Receiver, Sender
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
+
+
+def _has_in_flight_generation(state: State, instance_id: InstanceId) -> bool:
+    """Whether a generation is still assigned to this instance.
+
+    Used to decide when a retiring instance has drained and can be torn down. Only
+    generations are counted, because only a generation makes teardown unsafe.
+
+    Worker lifecycle tasks must not count. One that never reaches a terminal status — a
+    stale DownloadModel, for instance, whose weights have long since arrived — would
+    otherwise pin the instance in the retiring set indefinitely. The master excludes
+    retiring instances from eligibility, so every subsequent request is then refused with
+    "a distributed instance is being recycled or replaced; retry in a few seconds", a
+    transient-sounding message for a condition that only a restart clears.
+    """
+    return any(
+        task.instance_id == instance_id
+        and task.task_status in {TaskStatus.Pending, TaskStatus.Running}
+        and isinstance(
+            task, (TextGenerationTask, ImageGenerationTask, ImageEditsTask)
+        )
+        for task in state.tasks.values()
+    )
 
 
 def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str | None:
@@ -119,6 +161,32 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
     return None
 
 
+def _recovery_placement(instance: Instance) -> PlaceInstance:
+    shards = list(instance.shard_assignments.runner_to_shard.values())
+    if not shards:
+        raise ValueError(f"Instance {instance.instance_id} has no shards")
+    first_shard = shards[0]
+    if isinstance(first_shard, TensorShardMetadata):
+        sharding = Sharding.Tensor
+    elif isinstance(first_shard, PipelineShardMetadata):
+        sharding = Sharding.Pipeline
+    else:
+        raise ValueError(
+            "Automatic distributed recovery does not support "
+            f"{first_shard.__class__.__name__}"
+        )
+    return PlaceInstance(
+        model_card=first_shard.model_card,
+        sharding=sharding,
+        instance_meta=(
+            InstanceMeta.MlxJaccl
+            if isinstance(instance, MlxJacclInstance)
+            else InstanceMeta.MlxRing
+        ),
+        min_nodes=len(instance.shard_assignments.node_to_runner),
+    )
+
+
 class Master:
     def __init__(
         self,
@@ -146,6 +214,10 @@ class Master:
         self._event_log = DiskEventLog(EXO_EVENT_LOG_DIR / "master")
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._expected_ranks: dict[TaskId, set[int]] = {}
+        self._recovering_instances: dict[InstanceId, tuple[float, PlaceInstance]] = {}
+        # A retiring instance is never selected for a new request.  It is
+        # removed as soon as its already-assigned requests have drained.
+        self._retiring_instances: dict[InstanceId, PlaceInstance] = {}
 
     async def run(self):
         logger.info("Starting Master")
@@ -194,6 +266,8 @@ class Master:
                                     instance.shard_assignments.model_id
                                     == command.task_params.model
                                     and instance.instance_id not in prefill_only
+                                    and instance.instance_id
+                                    not in self._retiring_instances
                                 ):
                                     # count in-flight tasks of that instance
                                     in_flight = {TaskStatus.Pending, TaskStatus.Running}
@@ -209,39 +283,64 @@ class Master:
 
                             # there are no NON-prefill-only instances matching this model ID
                             if not instance_task_counts:
-                                raise ValueError(
-                                    f"No instance found for model {command.task_params.model}"
+                                # Raising here went into the command processor's
+                                # catch-all and emitted nothing, so the client
+                                # learned nothing and waited out the full task
+                                # stall timeout for a condition known instantly.
+                                # `_retiring_instances` is master-local, so the
+                                # API's validation cannot see it and will happily
+                                # publish a command the master then refuses.
+                                logger.warning(
+                                    "Rejecting generation: no eligible instance for "
+                                    f"model={command.task_params.model} "
+                                    f"instances={len(self.state.instances)} "
+                                    f"retiring={len(self._retiring_instances)} "
+                                    f"prefill_only={len(prefill_only)}"
                                 )
-
-                            available_instance_ids = sorted(
-                                instance_task_counts.keys(),
-                                key=lambda instance_id: instance_task_counts[
-                                    instance_id
-                                ],
-                            )
-
-                            decode_instance_id = available_instance_ids[0]
-                            task_id = TaskId()
-                            params = command.task_params.model_copy(
-                                update={
-                                    "prefill_endpoint": _prefill_endpoint_for(
-                                        self.state, decode_instance_id
-                                    ),
-                                }
-                            )
-                            generated_events.append(
-                                TaskCreated(
-                                    task_id=task_id,
-                                    task=TextGenerationTask(
-                                        task_id=task_id,
+                                generated_events.append(
+                                    ChunkGenerated(
                                         command_id=command.command_id,
-                                        instance_id=decode_instance_id,
-                                        task_status=TaskStatus.Pending,
-                                        task_params=params,
-                                    ),
+                                        chunk=ErrorChunk(
+                                            model=command.task_params.model,
+                                            error_message=(
+                                                "No instance is currently able to serve "
+                                                f"model {command.task_params.model}. A "
+                                                "distributed instance is being recycled "
+                                                "or replaced; retry in a few seconds."
+                                            ),
+                                        ),
+                                    )
                                 )
-                            )
-                            self.command_task_mapping[command.command_id] = task_id
+                            else:
+                                available_instance_ids = sorted(
+                                    instance_task_counts.keys(),
+                                    key=lambda instance_id: instance_task_counts[
+                                        instance_id
+                                    ],
+                                )
+
+                                decode_instance_id = available_instance_ids[0]
+                                task_id = TaskId()
+                                params = command.task_params.model_copy(
+                                    update={
+                                        "prefill_endpoint": _prefill_endpoint_for(
+                                            self.state, decode_instance_id
+                                        ),
+                                    }
+                                )
+                                generated_events.append(
+                                    TaskCreated(
+                                        task_id=task_id,
+                                        task=TextGenerationTask(
+                                            task_id=task_id,
+                                            command_id=command.command_id,
+                                            instance_id=decode_instance_id,
+                                            task_status=TaskStatus.Pending,
+                                            task_params=params,
+                                        ),
+                                    )
+                                )
+                                self.command_task_mapping[command.command_id] = task_id
                         case ImageGeneration():
                             for instance in self.state.instances.values():
                                 if (
@@ -422,7 +521,29 @@ class Master:
                                     command.finished_command_id, None
                                 )
                             ) is not None:
+                                task = self.state.tasks.get(task_id)
                                 generated_events.append(TaskDeleted(task_id=task_id))
+                                if isinstance(task, TextGenerationTask):
+                                    instance = self.state.instances.get(
+                                        task.instance_id
+                                    )
+                                    if (
+                                        EXO_RECYCLE_DISTRIBUTED_MLX_AFTER_GENERATION
+                                        and isinstance(instance, MlxJacclInstance)
+                                        and len(
+                                            instance.shard_assignments.node_to_runner
+                                        )
+                                        > 1
+                                    ):
+                                        self._retiring_instances[
+                                            instance.instance_id
+                                        ] = _recovery_placement(instance)
+                                        logger.info(
+                                            "Distributed MLX generation completed; "
+                                            "retiring the JACCL instance before reuse "
+                                            f"instance_id={instance.instance_id} "
+                                            f"task_id={task_id}"
+                                        )
                             else:
                                 logger.warning(
                                     f"Finished command {command.finished_command_id} finished"
@@ -470,6 +591,123 @@ class Master:
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
         while True:
+            # A completed distributed generation may leave native JACCL/Metal
+            # state that cannot safely serve another large request.  Drain any
+            # requests that were already assigned, then remove both ranks as a
+            # single failure domain.  Placement below recreates fresh runners.
+            for instance_id, recovery_command in list(
+                self._retiring_instances.items()
+            ):
+                instance = self.state.instances.get(instance_id)
+                if instance is None:
+                    self._retiring_instances.pop(instance_id, None)
+                    continue
+                in_flight = _has_in_flight_generation(self.state, instance_id)
+                if in_flight:
+                    continue
+
+                self._recovering_instances[instance_id] = (
+                    anyio.current_time()
+                    + EXO_DISTRIBUTED_RECYCLE_COOLDOWN_SECONDS,
+                    recovery_command,
+                )
+                self._retiring_instances.pop(instance_id, None)
+                logger.info(
+                    "Distributed MLX instance drained; shutting down all ranks "
+                    f"instance_id={instance_id} "
+                    "reason=post_generation_recycle "
+                    f"cooldown_seconds={EXO_DISTRIBUTED_RECYCLE_COOLDOWN_SECONDS}"
+                )
+                target_instances = dict(self.state.instances)
+                del target_instances[instance_id]
+                for event in get_transition_events(
+                    self.state.instances, target_instances, self.state.tasks
+                ):
+                    await self.event_sender.send(event)
+
+            # A distributed backend is one failure domain. Reusing one side of
+            # a failed JACCL generation leaves stale queue pairs on its peer,
+            # so tear down the whole instance and later place a fresh one.
+            for instance_id, instance in list(self.state.instances.items()):
+                if (
+                    len(instance.shard_assignments.node_to_runner) <= 1
+                    or instance_id in self._recovering_instances
+                    or instance_id in self._retiring_instances
+                ):
+                    continue
+                failed_runners = [
+                    runner_id
+                    for runner_id in instance.shard_assignments.runner_to_shard
+                    if isinstance(self.state.runners.get(runner_id), RunnerFailed)
+                ]
+                if not failed_runners:
+                    continue
+
+                recovery_command = _recovery_placement(instance)
+                self._recovering_instances[instance_id] = (
+                    anyio.current_time() + 30,
+                    recovery_command,
+                )
+                logger.error(
+                    "Distributed instance failure detected; deleting entire "
+                    f"generation instance_id={instance_id} "
+                    f"failed_runners={failed_runners} cooldown_seconds=30"
+                )
+                target_instances = dict(self.state.instances)
+                del target_instances[instance_id]
+                for event in get_transition_events(
+                    self.state.instances, target_instances, self.state.tasks
+                ):
+                    await self.event_sender.send(event)
+
+            for old_instance_id, (
+                ready_at,
+                recovery_command,
+            ) in list(self._recovering_instances.items()):
+                if old_instance_id in self.state.instances:
+                    continue
+                if anyio.current_time() < ready_at:
+                    continue
+                try:
+                    placement = place_instance(
+                        recovery_command,
+                        self.state.topology,
+                        self.state.instances,
+                        self.state.node_memory,
+                        self.state.node_network,
+                        self.state.node_backends,
+                        download_status=self.state.downloads,
+                        node_rdma_ctl=self.state.node_rdma_ctl,
+                    )
+                    transition_events = get_transition_events(
+                        self.state.instances, placement, self.state.tasks
+                    )
+                    created = next(
+                        (
+                            event
+                            for event in transition_events
+                            if isinstance(event, InstanceCreated)
+                        ),
+                        None,
+                    )
+                    if created is None:
+                        raise RuntimeError(
+                            "recovery placement did not create a fresh instance"
+                        )
+                    logger.info(
+                        "Distributed instance cooldown complete; creating fresh "
+                        f"generation old_instance_id={old_instance_id} "
+                        f"new_instance_id={created.instance.instance_id}"
+                    )
+                    for event in transition_events:
+                        await self.event_sender.send(event)
+                    del self._recovering_instances[old_instance_id]
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "Unable to place fresh distributed generation yet; "
+                        f"old_instance_id={old_instance_id}"
+                    )
+
             # kill broken instances
             connected_node_ids = set(self.state.topology.list_nodes())
             for instance_id, instance in self.state.instances.items():
