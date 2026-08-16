@@ -1,9 +1,12 @@
 import base64
 import contextlib
 import hashlib
+import io
 import json
+import os
 import random
 import time
+import zipfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -132,6 +135,7 @@ from exo.shared.constants import (
     EXO_CACHE_HOME,
     EXO_EVENT_LOG_DIR,
     EXO_IMAGE_CACHE_DIR,
+    EXO_LOG_DIR,
     EXO_MAX_CHUNK_SIZE,
     EXO_TRACING_CACHE_DIR,
 )
@@ -200,6 +204,12 @@ from exo.shared.types.text_generation import (
 )
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
+from exo.shared.types.worker.runners import (
+    RunnerFailed,
+    RunnerReady,
+    RunnerRunning,
+    RunnerShutdown,
+)
 from exo.shared.types.worker.shards import Sharding
 from exo.utils.banner import print_startup_banner
 from exo.utils.channels import Receiver, Sender, channel
@@ -209,6 +219,7 @@ from exo.utils.task_group import TaskGroup
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
+TASK_STALL_TIMEOUT_SECONDS = float(os.getenv("EXO_TASK_STALL_TIMEOUT", "180"))
 
 
 def _format_to_content_type(image_format: Literal["png", "jpeg", "webp"] | None) -> str:
@@ -246,6 +257,7 @@ class API:
         download_command_sender: Sender[ForwarderDownloadCommand],
         # This lets us pause the API if an election is running
         election_receiver: Receiver[ElectionMessage],
+        network_health_provider: Callable[[], dict[str, object]] | None = None,
     ) -> None:
         self.state = State()
         self._event_log = DiskEventLog(_API_EVENT_LOG_DIR)
@@ -257,6 +269,7 @@ class API:
         self.node_id: NodeId = node_id
         self.last_completed_election: int = 0
         self.port = port
+        self._network_health_provider = network_health_provider or dict
         self._sent_image_hashes: set[str] = set()
 
         self.paused: bool = False
@@ -289,6 +302,7 @@ class API:
             CommandId,
             Sender[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
         ] = {}
+        self._task_progress: dict[CommandId, dict[str, Any]] = {}
         self._image_generation_queues: dict[
             CommandId, Sender[ImageChunk | ErrorChunk]
         ] = {}
@@ -302,6 +316,7 @@ class API:
         self.state = State()
         self._system_id = SystemId()
         self._text_generation_queues = {}
+        self._task_progress = {}
         self._image_generation_queues = {}
         self.unpause(result_clock)
         self.event_receiver.close()
@@ -376,6 +391,9 @@ class API:
         self.app.post("/v1/messages", response_model=None)(self.claude_messages)
         self.app.post("/v1/responses", response_model=None)(self.openai_responses)
         self.app.post("/v1/cancel/{command_id}")(self.cancel_command)
+        self.app.get("/v1/tasks/progress/{command_id}")(self.get_task_progress)
+        self.app.get("/v1/cluster/health")(self.get_cluster_health)
+        self.app.get("/v1/diagnostics/bundle")(self.get_diagnostic_bundle)
 
         # Ollama API
         self.app.head("/ollama/")(self.ollama_version)
@@ -425,6 +443,125 @@ class API:
                 status_code=404,
                 detail=f"unable to find path '{path.replace('/', '.')}' in state json",
             ) from e
+
+    def get_cluster_health(self) -> dict[str, object]:
+        now = datetime.now(timezone.utc)
+        node_health: dict[str, dict[str, object]] = {}
+        for node_id in self.state.topology.list_nodes():
+            last_seen = self.state.last_seen.get(node_id)
+            age_seconds = (
+                max(0.0, (now - last_seen).total_seconds())
+                if last_seen is not None
+                else None
+            )
+            node_health[str(node_id)] = {
+                "lastSeen": last_seen.isoformat() if last_seen else None,
+                "ageSeconds": age_seconds,
+                "healthy": age_seconds is not None and age_seconds <= 15,
+            }
+
+        runner_states = {
+            str(runner_id): {
+                "status": runner.__class__.__name__,
+                "runtimeBuildId": runner.runtime_build_id,
+                "dataPlaneGeneration": runner.data_plane_generation,
+                "activeManifestHash": runner.active_manifest_hash,
+            }
+            for runner_id, runner in self.state.runners.items()
+        }
+        ready_runners = [
+            runner
+            for runner in self.state.runners.values()
+            if isinstance(runner, (RunnerReady, RunnerRunning))
+        ]
+        build_ids = {
+            runner.runtime_build_id
+            for runner in ready_runners
+            if runner.runtime_build_id is not None
+        }
+        generations = {
+            runner.data_plane_generation
+            for runner in ready_runners
+            if runner.data_plane_generation is not None
+        }
+        active_manifests = {
+            runner.active_manifest_hash
+            for runner in ready_runners
+            if runner.active_manifest_hash is not None
+        }
+        return {
+            "checkedAt": now.isoformat(),
+            "controlPlane": self._network_health_provider(),
+            "nodes": node_health,
+            "dataPlane": {
+                "ready": bool(ready_runners)
+                and all(
+                    isinstance(runner, (RunnerReady, RunnerRunning))
+                    for runner in self.state.runners.values()
+                )
+                and len(build_ids) == 1
+                and len(generations) == 1
+                and len(active_manifests) <= 1,
+                "runners": runner_states,
+                "runtimeBuildIds": sorted(build_ids),
+                "generations": sorted(generations),
+                "activeManifestHashes": sorted(active_manifests),
+            },
+        }
+
+    def get_diagnostic_bundle(self) -> StreamingResponse:
+        """Return a bounded, self-contained snapshot for distributed failures."""
+        checked_at = datetime.now(timezone.utc)
+        manifest = {
+            "createdAt": checked_at.isoformat(),
+            "nodeId": str(self.node_id),
+            "taskStallTimeoutSeconds": TASK_STALL_TIMEOUT_SECONDS,
+            "logDirectory": str(EXO_LOG_DIR),
+        }
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            buffer, mode="w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+            archive.writestr(
+                "cluster-health.json",
+                json.dumps(self.get_cluster_health(), indent=2, default=str),
+            )
+            archive.writestr(
+                "task-progress.json",
+                json.dumps(self._task_progress, indent=2, default=str),
+            )
+            archive.writestr(
+                "state.json",
+                self.state.model_dump_json(by_alias=True, indent=2),
+            )
+
+            # Preserve enough context to diagnose a hang without allowing an
+            # old, unbounded log directory to produce a multi-gigabyte bundle.
+            log_paths = sorted(
+                (path for path in EXO_LOG_DIR.rglob("*.log") if path.is_file()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )[:24]
+            max_tail_bytes = 5 * 1024 * 1024
+            for path in log_paths:
+                with path.open("rb") as log_file:
+                    size = path.stat().st_size
+                    if size > max_tail_bytes:
+                        log_file.seek(size - max_tail_bytes)
+                    payload = log_file.read(max_tail_bytes)
+                archive.writestr(
+                    f"logs/{path.relative_to(EXO_LOG_DIR)}",
+                    payload,
+                )
+
+        buffer.seek(0)
+        filename = checked_at.strftime("exo-diagnostics-%Y%m%dT%H%M%SZ.zip")
+        return StreamingResponse(
+            buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     async def place_instance(self, payload: PlaceInstanceParams):
         command = PlaceInstance(
@@ -754,6 +891,12 @@ class API:
             command_id=command_id,
         )
 
+    async def get_task_progress(self, command_id: CommandId) -> JSONResponse:
+        progress = self._task_progress.get(command_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail="Task progress not found")
+        return JSONResponse(progress)
+
     async def _token_chunk_stream(
         self, command_id: CommandId
     ) -> AsyncGenerator[
@@ -763,17 +906,95 @@ class API:
 
         This is the internal low-level stream used by all API adapters.
         """
+        stalled = False
         try:
             self._text_generation_queues[command_id], recv = channel[
                 TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
             ]()
+            self._task_progress[command_id] = {
+                "command_id": str(command_id),
+                "phase": "queued",
+                "processed_tokens": 0,
+                "total_tokens": None,
+                "generated_tokens": 0,
+                "last_progress_at": datetime.now(timezone.utc).isoformat(),
+                "status": "running",
+                "stall_timeout_seconds": TASK_STALL_TIMEOUT_SECONDS,
+            }
+            generated_tokens = 0
 
             with recv as token_chunks:
-                async for chunk in token_chunks:
+                while True:
+                    chunk: (
+                        TokenChunk
+                        | ErrorChunk
+                        | ToolCallChunk
+                        | PrefillProgressChunk
+                        | None
+                    ) = None
+                    with anyio.move_on_after(TASK_STALL_TIMEOUT_SECONDS) as scope:
+                        chunk = await token_chunks.receive()
+                    if scope.cancel_called:
+                        stalled = True
+                        progress = self._task_progress[command_id]
+                        health = self.get_cluster_health()
+                        message = (
+                            "Distributed inference made no progress for "
+                            f"{TASK_STALL_TIMEOUT_SECONDS:g} seconds; Exo cancelled "
+                            "the task and is restarting its runners. "
+                            f"Last phase={progress.get('phase')}, "
+                            f"prefill={progress.get('processed_tokens')}/"
+                            f"{progress.get('total_tokens')}, "
+                            f"generated={progress.get('generated_tokens')}, "
+                            f"dataPlane={health.get('dataPlane')}."
+                        )
+                        self._task_progress[command_id].update(
+                            {
+                                "phase": "stalled",
+                                "status": "failed",
+                                "error": message,
+                                "cluster_health_at_failure": health,
+                            }
+                        )
+                        await self._send(TaskCancelled(cancelled_command_id=command_id))
+                        yield ErrorChunk(
+                            model=ModelId("unknown"), error_message=message
+                        )
+                        break
+
+                    assert chunk is not None
+                    now = datetime.now(timezone.utc).isoformat()
+                    if isinstance(chunk, PrefillProgressChunk):
+                        self._task_progress[command_id].update(
+                            {
+                                "phase": "prefill",
+                                "processed_tokens": chunk.processed_tokens,
+                                "total_tokens": chunk.total_tokens,
+                                "last_progress_at": now,
+                            }
+                        )
+                    else:
+                        if isinstance(chunk, TokenChunk):
+                            generated_tokens += 1
+                        self._task_progress[command_id].update(
+                            {
+                                "phase": "decode",
+                                "generated_tokens": generated_tokens,
+                                "last_progress_at": now,
+                            }
+                        )
                     yield chunk
                     if isinstance(chunk, PrefillProgressChunk):
                         continue
                     if chunk.finish_reason is not None:
+                        failed = chunk.finish_reason == "error"
+                        self._task_progress[command_id].update(
+                            {
+                                "phase": "failed" if failed else "complete",
+                                "status": "failed" if failed else "complete",
+                                "last_progress_at": now,
+                            }
+                        )
                         break
 
         except anyio.get_cancelled_exc_class():
@@ -784,6 +1005,12 @@ class API:
                 )
             raise
         finally:
+            if stalled:
+                # Keep the cancelled task in event-sourced state long enough
+                # for every worker plan to observe it. Deleting it immediately
+                # can race the cancellation event and leave a Metal collective
+                # blocked while the client retries against the same runner.
+                await anyio.sleep(35)
             await self._send(TaskFinished(finished_command_id=command_id))
             if command_id in self._text_generation_queues:
                 del self._text_generation_queues[command_id]
@@ -865,12 +1092,16 @@ class API:
         )
 
     async def _send_text_generation_with_images(
-        self, task_params: TextGenerationTaskParams
+        self,
+        task_params: TextGenerationTaskParams,
+        command_id: CommandId | None = None,
     ) -> TextGeneration:
         task_params = task_params.with_card_sampling_defaults()
         images = task_params.images
         if not images:
-            command = TextGeneration(task_params=task_params)
+            command = TextGeneration(
+                command_id=command_id or CommandId(), task_params=task_params
+            )
             await self._send(command)
             return command
 
@@ -879,7 +1110,9 @@ class API:
         task_params = task_params.model_copy(
             update={"images": [], "image_hashes": all_hashes}
         )
-        command = TextGeneration(task_params=task_params)
+        command = TextGeneration(
+            command_id=command_id or CommandId(), task_params=task_params
+        )
 
         new_images: list[tuple[int, str]] = []
         for idx, (img, h) in enumerate(zip(images, hashes, strict=True)):
@@ -991,10 +1224,12 @@ class API:
 
         Raises HTTPException 404 if no instance is found for the model.
         """
-        if not any(
-            instance.shard_assignments.model_id == model_id
+        matching_instances = [
+            instance
             for instance in self.state.instances.values()
-        ):
+            if instance.shard_assignments.model_id == model_id
+        ]
+        if not matching_instances:
             # Check if model is actually downloaded
             model_is_downloaded = any(
                 isinstance(download, DownloadCompleted)
@@ -1008,7 +1243,112 @@ class API:
             raise HTTPException(
                 status_code=404, detail=f"No instance found for model {model_id}"
             )
+        distributed = next(
+            (
+                instance
+                for instance in matching_instances
+                if len(instance.shard_assignments.node_to_runner) > 1
+            ),
+            None,
+        )
+        if distributed is not None:
+            await self._await_distributed_instance_healthy(distributed)
         return model_id
+
+    async def _await_distributed_instance_healthy(
+        self, instance: Instance, timeout_seconds: float = 120
+    ) -> None:
+        """Wait through normal runner initialization, rejecting real failures."""
+        deadline = anyio.current_time() + timeout_seconds
+        assigned_runners = list(instance.shard_assignments.node_to_runner.values())
+
+        while True:
+            now = datetime.now(timezone.utc)
+            stale_nodes = [
+                str(node_id)
+                for node_id in instance.shard_assignments.node_to_runner
+                if (last_seen := self.state.last_seen.get(node_id)) is None
+                or (now - last_seen).total_seconds() > 15
+            ]
+            if stale_nodes:
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail=(
+                        "Distributed cluster health check failed before "
+                        f"inference: stale nodes={stale_nodes}"
+                    ),
+                )
+
+            runner_states = [
+                self.state.runners.get(runner_id) for runner_id in assigned_runners
+            ]
+            failed_runners = [
+                str(runner_id)
+                for runner_id, state in zip(
+                    assigned_runners, runner_states, strict=True
+                )
+                if isinstance(state, (RunnerFailed, RunnerShutdown))
+            ]
+            if failed_runners:
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail=(
+                        "Distributed data plane failed its readiness check: "
+                        f"failed runners={failed_runners}"
+                    ),
+                )
+
+            if all(
+                isinstance(state, (RunnerReady, RunnerRunning))
+                for state in runner_states
+            ):
+                build_ids = {
+                    state.runtime_build_id
+                    for state in runner_states
+                    if state is not None
+                }
+                if None in build_ids or len(build_ids) != 1:
+                    raise HTTPException(
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        detail=(
+                            "Distributed runners have mismatched MLX runtime "
+                            f"builds: {sorted(str(value) for value in build_ids)}"
+                        ),
+                    )
+                generations = {
+                    state.data_plane_generation
+                    for state in runner_states
+                    if state is not None
+                }
+                expected_generation = str(instance.instance_id)
+                if generations != {expected_generation}:
+                    raise HTTPException(
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        detail=(
+                            "Distributed runners belong to different data-plane "
+                            f"generations: expected={expected_generation}, "
+                            f"reported={sorted(str(value) for value in generations)}"
+                        ),
+                    )
+                return
+
+            if anyio.current_time() >= deadline:
+                pending_runners = [
+                    str(runner_id)
+                    for runner_id, state in zip(
+                        assigned_runners, runner_states, strict=True
+                    )
+                    if not isinstance(state, (RunnerReady, RunnerRunning))
+                ]
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail=(
+                        "Distributed data plane did not become ready within "
+                        f"{timeout_seconds:g} seconds: "
+                        f"pending runners={pending_runners}"
+                    ),
+                )
+            await anyio.sleep(0.25)
 
     def stream_events(self) -> StreamingResponse:
         def _generate_json_array(events: Iterable[Event]) -> Iterable[str]:
@@ -1620,7 +1960,11 @@ class API:
         )
         task_params = task_params.model_copy(update={"model": validated_model})
 
-        command = await self._send_text_generation_with_images(task_params)
+        requested_id = request.headers.get("x-exo-request-id")
+        command = await self._send_text_generation_with_images(
+            task_params,
+            CommandId(requested_id) if requested_id else None,
+        )
 
         if payload.stream:
             return StreamingResponse(
@@ -1639,6 +1983,7 @@ class API:
             return StreamingResponse(
                 collect_ollama_chat_response(
                     command.command_id,
+                    str(validated_model),
                     self._token_chunk_stream(command.command_id),
                 ),
                 media_type="application/json",

@@ -311,10 +311,24 @@ exo supports several environment variables for configuration:
 | `EXO_MODELS_DIRS` | Colon-separated additional writable directories for model downloads. Checked in order after the default; first with enough free space is used. | None |
 | `EXO_MODELS_READ_ONLY_DIRS` | Colon-separated read-only directories to search for pre-downloaded models (e.g., NFS mounts, shared storage). Models here cannot be deleted. | None |
 | `EXO_OFFLINE` | Run without internet connection (uses only local models) | `false` |
+| `EXO_DISCOVERY_INTERFACE` | Restrict peer discovery and discovered peer connections to one interface (for example, `en0`) | All multicast-capable interfaces |
+| `EXO_BOOTSTRAP_PEERS` | Comma-separated fixed Zenoh TCP endpoints. These reconnect independently of multicast discovery. | None |
+| `EXO_PEER_EXPIRY_GRACE` | Seconds to wait before starting a master election after peer expiry. Distributed runners abort immediately; values above 60 are capped. | `30` |
+| `EXO_TASK_STALL_TIMEOUT` | Seconds without a prefill or decode progress event before cancelling the distributed task; blocked runners are restarted after a 30-second cancellation grace | `180` |
+| `EXO_MLX_PIPELINE_PREFILL_STEP_SIZE` | Tokens per stable distributed MLX prefill step. A conservative size avoids large-message JACCL stalls; single-node prefill remains at 4096. | `512` |
+| `EXO_MLX_EXPERIMENTAL_CHUNKED_PIPELINE_PREFILL` | Enable the experimental rank-offset chunked MLX pipeline prefill. Disabled by default because it can stall in MLX/JACCL; the stable `stream_generate` path is used instead. | `0` |
 | `EXO_ENABLE_IMAGE_MODELS` | Enable image model support | `false` |
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
+
+Cluster health is available at `/v1/cluster/health`. The dashboard polls this
+endpoint and provides a **Download diagnostics** link. The resulting ZIP from
+`/v1/diagnostics/bundle` contains the cluster state, task progress, health at
+capture time, and bounded tails of the newest logs. In addition to the
+compatibility log at `~/.exo/exo_log/exo.log`, each Exo process and runner
+launch now receives a uniquely named log so a restart cannot erase the evidence
+from the previous failure.
 
 **Example usage:**
 
@@ -327,6 +341,17 @@ EXO_MODELS_DIRS=/Volumes/ExternalSSD/exo-models uv run exo
 
 # Run in offline mode
 EXO_OFFLINE=true uv run exo
+
+# Keep cluster discovery and peer connections on dedicated Ethernet
+EXO_DISCOVERY_INTERFACE=en0 uv run exo --namespace my-cluster
+
+# Prefer a deterministic peer on a dedicated Ethernet subnet. Configure the
+# other Mac with the reciprocal endpoint.
+EXO_BOOTSTRAP_PEERS='tcp/10.77.0.2:52414' \
+  uv run exo --namespace my-cluster --discovery-interface en0
+
+# Briefly debounce elections without leaving failed inference running.
+EXO_PEER_EXPIRY_GRACE=30 uv run exo --namespace my-cluster
 
 # Enable image models
 EXO_ENABLE_IMAGE_MODELS=true uv run exo
@@ -527,6 +552,95 @@ For further details, see:
 
 - API documentation in [docs/api.md](docs/api.md).
 - API types and endpoints in [src/exo/master/api.py](src/exo/master/api.py).
+
+---
+
+## Two-Mac MLX/JACCL reliability workflow
+
+Use the same Exo source tree and the same matched `mlx`/`mlx-metal` wheels on
+both Macs. A distributed instance is now admitted only after:
+
+1. Ethernet discovery reports both nodes as fresh.
+2. Each runner has initialized its MLX group.
+3. A real JACCL `all_sum` and bidirectional transfer complete.
+4. Both runners report the same content-derived MLX build ID.
+5. Both runners report the current instance generation.
+6. The requested task has a deterministic manifest hash in each runner log.
+
+Before starting Exo, verify the complete runtime on Mac 1:
+
+```bash
+cd /Users/vividhsiddha/repos/exo
+.venv/bin/python scripts/verify_mlx_runtime.py
+```
+
+Copy the printed `buildId`, then require the same ID on Mac 2:
+
+```bash
+cd /Users/vividhsiddha/repos/exo
+.venv/bin/python scripts/verify_mlx_runtime.py \
+  --expected-build-id BUILD_ID_FROM_MAC_1
+```
+
+To isolate JACCL from model loading, run the transport probe simultaneously.
+Replace the coordinator and RDMA device names with the values shown by Exo:
+
+```bash
+# Mac 1
+.venv/bin/python scripts/mlx_jaccl_probe.py \
+  --rank 0 --coordinator 169.254.139.1:50000 \
+  --devices '[[null,"rdma_en2"],["rdma_en2",null]]'
+
+# Mac 2
+.venv/bin/python scripts/mlx_jaccl_probe.py \
+  --rank 1 --coordinator 169.254.139.1:50000 \
+  --devices '[[null,"rdma_en2"],["rdma_en2",null]]'
+```
+
+Then validate prompt-size boundaries:
+
+```bash
+.venv/bin/python scripts/exo_prompt_sweep.py \
+  --model mlx-community/medgemma-27b-text-it-4bit
+```
+
+Finally run a repeated full-stack soak. It checks live control/data-plane
+health before every inference and downloads a diagnostic ZIP on the first
+failure:
+
+```bash
+.venv/bin/python scripts/exo_cluster_soak.py \
+  --model mlx-community/medgemma-27b-text-it-4bit \
+  --iterations 20
+```
+
+The dashboard health endpoint is also available directly:
+
+```bash
+curl http://127.0.0.1:52415/v1/cluster/health | python -m json.tool
+```
+
+For a reproducible wheel pair, build both stages from one clean MLX checkout
+and one explicit Xcode toolchain:
+
+```bash
+scripts/build_patched_mlx_wheels.sh \
+  /path/to/clean/patched-mlx-checkout \
+  dist/mlx-patched \
+  /Applications/Xcode.app/Contents/Developer
+```
+
+Install both wheels together; never mix a `core` extension from one build with
+`libmlx.dylib` from another:
+
+```bash
+uv pip install --python .venv/bin/python --reinstall --no-deps \
+  dist/mlx-patched/mlx_metal-*.whl \
+  dist/mlx-patched/mlx-0.32.0-*.whl
+```
+
+Set `EXO_MLX_DATA_PLANE_PROBE=0` only for diagnosis. Disabling it removes the
+pre-inference proof that the JACCL path is usable.
 
 ---
 

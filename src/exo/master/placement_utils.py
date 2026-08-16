@@ -1,3 +1,4 @@
+import os
 from collections.abc import Generator, Mapping
 
 from loguru import logger
@@ -99,15 +100,37 @@ def _allocate_and_validate_layers(
     total_memory: Memory,
     model_card: ModelCard,
 ) -> list[int]:
+    memory_fractions = [
+        node_memory[node_id].ram_available / total_memory for node_id in node_ids
+    ]
     layer_allocations = allocate_layers_proportionally(
         total_layers=model_card.n_layers,
-        memory_fractions=[
-            node_memory[node_id].ram_available / total_memory for node_id in node_ids
-        ],
+        memory_fractions=memory_fractions,
     )
 
     total_storage = model_card.storage_size
     total_layers = model_card.n_layers
+
+    # Available-memory samples fluctuate substantially while macOS and Metal are
+    # active. On a two-Mac pipeline this previously turned a healthy 31/31 split
+    # into 41/21, causing the 41-layer rank to run out of Metal memory during a
+    # long prefill. Prefer an even split whenever both nodes can hold their half
+    # of the weights. EXO_PIPELINE_FORCE_BALANCED can explicitly enable/disable
+    # this policy for troubleshooting.
+    balance_setting = os.getenv("EXO_PIPELINE_FORCE_BALANCED", "auto").lower()
+    if len(node_ids) == 2 and balance_setting not in {"0", "false", "no"}:
+        balanced = [total_layers // 2, total_layers - (total_layers // 2)]
+        balanced_fits = all(
+            (total_storage * balanced[i]) // total_layers
+            <= node_memory[node_id].ram_available
+            for i, node_id in enumerate(node_ids)
+        )
+        if balanced_fits or balance_setting in {"1", "true", "yes"}:
+            logger.info(
+                "Using balanced two-node pipeline placement "
+                f"layers={balanced} proportional_candidate={layer_allocations}"
+            )
+            layer_allocations = balanced
     for i, node_id in enumerate(node_ids):
         node_layers = layer_allocations[i]
         required_memory = (total_storage * node_layers) // total_layers
@@ -440,10 +463,37 @@ def get_mlx_jaccl_coordinators(
     address in format "X.X.X.X:PORT" per node.
     """
     logger.debug(f"Selecting coordinator: {coordinator}")
+    requested_interface = os.getenv("EXO_JACCL_COORDINATOR_INTERFACE")
 
     def get_ip_for_node(n: NodeId) -> str:
         if n == coordinator:
             return "0.0.0.0"
+
+        if requested_interface:
+            reachable_ips = set(
+                _find_connection_ip(n, coordinator, cycle_digraph)
+            )
+            coordinator_network = node_network.get(
+                coordinator, NodeNetworkInfo()
+            )
+            matching_ips = [
+                interface.ip_address
+                for interface in coordinator_network.interfaces
+                if interface.name == requested_interface
+                and interface.ip_address in reachable_ips
+            ]
+            if matching_ips:
+                selected = matching_ips[0]
+                logger.info(
+                    "Pinned MLX JACCL coordinator traffic to "
+                    f"interface={requested_interface} address={selected}"
+                )
+                return selected
+            logger.warning(
+                "Could not map the reachable MLX JACCL coordinator address "
+                f"to interface={requested_interface}; falling back to the "
+                "best reachable address selected from the discovery topology"
+            )
 
         ip = find_ip_prioritised(
             n, coordinator, cycle_digraph, node_network, ring=False

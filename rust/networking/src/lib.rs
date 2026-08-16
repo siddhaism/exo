@@ -20,7 +20,11 @@ pub fn is_valid_zid(identity: &str) -> bool {
         && identity.len() <= 32
 }
 
-pub fn cfg(identity: &str, listen_port: u16) -> Result<zenoh::Config> {
+pub fn cfg(
+    identity: &str,
+    listen_port: u16,
+    bootstrap_peers: &[String],
+) -> Result<zenoh::Config> {
     assert!(is_valid_zid(identity));
     assert!(identity.len() <= 32);
     assert!(listen_port != 0, "must used defined listen port");
@@ -29,6 +33,22 @@ pub fn cfg(identity: &str, listen_port: u16) -> Result<zenoh::Config> {
     cfg.insert_json5("id", &format!("\"{identity}\""))?;
     cfg.insert_json5("mode", "\"router\"")?;
     cfg.insert_json5("listen/endpoints", &format!("[\"tcp/[::]:{listen_port}\"]"))?;
+    if !bootstrap_peers.is_empty() {
+        if bootstrap_peers.iter().any(|peer| {
+            !peer.is_ascii() || peer.contains('"') || peer.contains('\\')
+        }) {
+            return Err("bootstrap peer endpoints must be ASCII and cannot contain quotes".into());
+        }
+        let endpoints = bootstrap_peers
+            .iter()
+            .map(|peer| format!("\"{peer}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        cfg.insert_json5(
+            "connect/endpoints",
+            &format!("[{endpoints}]"),
+        )?;
+    }
     cfg.insert_json5("scouting/multicast/enabled", "false")?;
     cfg.insert_json5("scouting/multicast/autoconnect", "[]")?;
     cfg.insert_json5("scouting/gossip/multihop", "true")?;
@@ -56,6 +76,7 @@ pub async fn open(
     namespace: &str,
     listen_port: u16,
     discovery_service_port: u16,
+    discovery_interface: Option<String>,
 ) -> Result<Session> {
     assert!(listen_port != 0, "must used defined listen port");
     let namespace: [u8; 8] = {
@@ -71,8 +92,14 @@ pub async fn open(
         .await?;
     let z = zenoh::session::init(runtime.clone().into()).await?;
     runtime.start().await?;
-    let mut discovery =
-        Discovery::new(z.zid(), namespace, listen_port, discovery_service_port).await?;
+    let mut discovery = Discovery::new(
+        z.zid(),
+        namespace,
+        listen_port,
+        discovery_service_port,
+        discovery_interface,
+    )
+    .await?;
     let _jh = Arc::new(AbortOnDrop(tokio::task::spawn(async move {
         loop {
             let Ok(discovered) = discovery.next().await.inspect_err(|e| {

@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import math
+import os
 import time
 import uuid
 from typing import Callable, Generator, cast, get_args
@@ -56,6 +57,9 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.structured_output import (
+    make_json_schema_logits_processor,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -77,6 +81,32 @@ REMOTE_PREFILL_MIN_TOKENS = 1000
 generation_stream = mx.new_stream(mx.default_device())
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
+
+
+def _log_mlx_memory(stage: str, rank: int) -> None:
+    logger.info(
+        f"MLX memory stage={stage} rank={rank} "
+        f"active_gb={mx.get_active_memory() / 1e9:.2f} "
+        f"peak_gb={mx.get_peak_memory() / 1e9:.2f} "
+        f"cache_gb={mx.get_cache_memory() / 1e9:.2f}"
+    )
+
+
+def _compatible_kv_bits(cache: KVCacheType, requested_bits: int | None) -> int | None:
+    if requested_bits is None:
+        return None
+    unsupported = [
+        type(entry).__name__
+        for entry in cache
+        if type(entry).__name__ == "RotatingKVCache"
+    ]
+    if unsupported:
+        logger.warning(
+            "KV-cache quantization requested but MLX does not support "
+            "RotatingKVCache quantization; continuing with an unquantized cache"
+        )
+        return None
+    return requested_bits
 
 
 @contextlib.contextmanager
@@ -154,6 +184,18 @@ class PrefillCancelled(BaseException):
     """Raised when prefill is cancelled via the progress callback."""
 
 
+class DistributedTokenBudgetError(ValueError):
+    """Raised when a request cannot fit the distributed token budget.
+
+    This is deterministic across ranks and raised before any collective in
+    mlx_generate, so every rank fails identically at the same point. That makes
+    it safe for the caller to drop the task and continue serving instead of
+    letting the exception terminate the runner — a single oversized request
+    should not cost a full model reload. Subclasses ValueError so existing
+    handlers keep working.
+    """
+
+
 def _has_pipeline_communication_layer(model: Model):
     for layer in model.layers:
         if isinstance(layer, (PipelineFirstLayer, PipelineLastLayer)):
@@ -169,7 +211,6 @@ def pipeline_parallel_prefill(
     kv_group_size: int | None,
     kv_bits: int | None,
     prompt_progress_callback: Callable[[int, int], None],
-    distributed_prompt_progress_callback: Callable[[], None] | None,
     group: mx.distributed.Group,
 ) -> None:
     """Prefill the KV cache for pipeline parallel with overlapping stages.
@@ -227,17 +268,41 @@ def pipeline_parallel_prefill(
     )
     clear_prefill_sends()
 
-    # Initial callback matching generate_step
+    # Pipeline ranks deliberately execute different work at a given loop
+    # iteration (for example, rank 0 can be running the model while rank 1 is
+    # still in a leading dummy stage).  Never invoke an MLX collective from
+    # inside this loop: doing so can interleave cancellation collectives with
+    # pipeline send/receive operations in a different order on each rank.
+    # Distributed cancellation/task agreement is disabled for the entire
+    # pipeline-prefill operation. Runner delivery is not synchronized tightly
+    # enough to safely insert an independent collective even immediately
+    # before or after this rank-offset loop. The API watchdog and runner
+    # supervisor recover a stalled prefill; cancellation checks resume during
+    # synchronized decode.
+
+    # Initial callback matching generate_step. This is telemetry only and must
+    # not perform distributed communication.
     prompt_progress_callback(0, total)
 
     try:
         with mx.stream(generation_stream):
-            for _ in range(n_leading):
-                if distributed_prompt_progress_callback is not None:
-                    distributed_prompt_progress_callback()
+            for iteration in range(n_leading):
+                logger.info(
+                    f"[R{rank}] Pipeline trace iteration={iteration}/{n_total} "
+                    "phase=leading begin"
+                )
+                logger.info(
+                    f"[R{rank}] Pipeline trace iteration={iteration}/{n_total} "
+                    "phase=leading end"
+                )
 
             for i in range(n_real):
                 chunk_size = real_chunk_sizes[i]
+                iteration = n_leading + i
+                logger.info(
+                    f"[R{rank}] Pipeline trace iteration={iteration}/{n_total} "
+                    f"phase=real begin processed={processed} total={total}"
+                )
                 model(
                     prompt[processed : processed + chunk_size][None],
                     cache=_prompt_cache,
@@ -245,16 +310,24 @@ def pipeline_parallel_prefill(
                 quantize_cache_fn(_prompt_cache)
                 processed += chunk_size
 
-                if distributed_prompt_progress_callback is not None:
-                    distributed_prompt_progress_callback()
-
                 flush_prefill_sends()
 
                 prompt_progress_callback(processed, total)
+                logger.info(
+                    f"[R{rank}] Pipeline trace iteration={iteration}/{n_total} "
+                    f"phase=real end processed={processed} total={total}"
+                )
 
-            for _ in range(n_trailing):
-                if distributed_prompt_progress_callback is not None:
-                    distributed_prompt_progress_callback()
+            for i in range(n_trailing):
+                iteration = n_leading + n_real + i
+                logger.info(
+                    f"[R{rank}] Pipeline trace iteration={iteration}/{n_total} "
+                    "phase=trailing begin"
+                )
+                logger.info(
+                    f"[R{rank}] Pipeline trace iteration={iteration}/{n_total} "
+                    "phase=trailing end"
+                )
 
     finally:
         clear_prefill_sends()
@@ -288,6 +361,7 @@ def prefill(
     group: mx.distributed.Group | None,
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
+    retain_prefix_snapshots: bool = False,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
@@ -315,12 +389,21 @@ def prefill(
         )
         if has_ssm:
             snapshots.append(snapshot_ssm_states(cache))
+            # Without prefix caching, only the final two snapshots are needed
+            # to roll back mlx-lm's extra prefill token. Retaining every
+            # callback snapshot duplicates the growing rotating KV cache and
+            # can exhaust Metal memory on long prompts.
+            if not retain_prefix_snapshots and len(snapshots) > 2:
+                snapshots.pop(0)
 
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
 
     def combined_progress_callback(processed: int, total: int) -> None:
-        if distributed_prompt_progress_callback is not None:
+        # Pipeline prefill must not interleave cancellation/task-agreement
+        # collectives with MLX pipeline communication, including for prompts
+        # small enough to use stream_generate instead of the chunked path.
+        if not is_pipeline and distributed_prompt_progress_callback is not None:
             distributed_prompt_progress_callback()
         progress_callback(processed, total)
 
@@ -330,11 +413,38 @@ def prefill(
     logger.info("Starting prefill")
 
     is_pipeline = _has_pipeline_communication_layer(model)
+    rank = group.rank() if group is not None else 0
+    effective_kv_bits = _compatible_kv_bits(cache, KV_BITS)
+    _log_mlx_memory("prefill_start", rank)
 
     prefill_step_size = 4096
+    if is_pipeline:
+        configured_step_size = os.getenv("EXO_MLX_PIPELINE_PREFILL_STEP_SIZE", "256")
+        try:
+            prefill_step_size = max(64, int(configured_step_size))
+        except ValueError:
+            logger.warning(
+                "Invalid EXO_MLX_PIPELINE_PREFILL_STEP_SIZE="
+                f"{configured_step_size!r}; using 256"
+            )
+            prefill_step_size = 256
+        logger.info(
+            f"Distributed pipeline prefill step size: {prefill_step_size} tokens"
+        )
+    use_experimental_chunked_prefill = (
+        os.getenv("EXO_MLX_EXPERIMENTAL_CHUNKED_PIPELINE_PREFILL", "0") == "1"
+    )
 
     try:
-        if is_pipeline and num_tokens >= prefill_step_size:
+        if (
+            is_pipeline
+            and num_tokens >= prefill_step_size
+            and use_experimental_chunked_prefill
+        ):
+            logger.warning(
+                "Using experimental chunked pipeline prefill; this path may "
+                "stall on MLX/JACCL"
+            )
             set_pipeline_queue_sends(model, queue_sends=True)
             assert group is not None, "Pipeline prefill requires a distributed group"
             pipeline_parallel_prefill(
@@ -343,12 +453,16 @@ def prefill(
                 prompt_cache=cache,
                 prefill_step_size=prefill_step_size,
                 kv_group_size=KV_GROUP_SIZE,
-                kv_bits=KV_BITS,
+                kv_bits=effective_kv_bits,
                 prompt_progress_callback=progress_callback,
-                distributed_prompt_progress_callback=distributed_prompt_progress_callback,
                 group=group,
             )
         else:
+            if is_pipeline and num_tokens >= prefill_step_size:
+                logger.info(
+                    "Using stable MLX stream_generate pipeline prefill; "
+                    "experimental chunked prefill is disabled"
+                )
             # Use max_tokens=1 because max_tokens=0 does not work.
             # We just throw away the generated token - we only care about filling the cache
             for _ in stream_generate(
@@ -360,7 +474,7 @@ def prefill(
                 prompt_cache=cache,
                 prefill_step_size=prefill_step_size,
                 kv_group_size=KV_GROUP_SIZE,
-                kv_bits=KV_BITS,
+                kv_bits=effective_kv_bits,
                 prompt_progress_callback=combined_progress_callback,
             ):
                 break  # Stop after first iteration - cache is now filled
@@ -387,6 +501,7 @@ def prefill(
             c.trim(2)
 
     elapsed = time.perf_counter() - start_time
+    _log_mlx_memory("prefill_complete", rank)
     tokens_per_sec = num_tokens / elapsed if elapsed > 0 else 0.0
     logger.debug(
         f"Prefill complete: {num_tokens} tokens in {elapsed:.2f}s "
@@ -572,9 +687,55 @@ def mlx_generate(
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
 
-    # Do not use the prefix cache if we are trying to do benchmarks.
+    if group is not None and group.size() > 1:
+        max_output_tokens = task.max_output_tokens or MAX_TOKENS
+        configured_limit = os.getenv("EXO_DISTRIBUTED_MAX_TOTAL_TOKENS", "10000")
+        configured_prompt_limit = os.getenv(
+            "EXO_DISTRIBUTED_MAX_PROMPT_TOKENS", "7000"
+        )
+        try:
+            max_total_tokens = max(1, int(configured_limit))
+        except ValueError:
+            logger.warning(
+                "Invalid EXO_DISTRIBUTED_MAX_TOTAL_TOKENS="
+                f"{configured_limit!r}; using 10000"
+            )
+            max_total_tokens = 10000
+        try:
+            max_prompt_tokens = max(1, int(configured_prompt_limit))
+        except ValueError:
+            logger.warning(
+                "Invalid EXO_DISTRIBUTED_MAX_PROMPT_TOKENS="
+                f"{configured_prompt_limit!r}; using 7000"
+            )
+            max_prompt_tokens = 7000
+        requested_total = len(all_prompt_tokens) + max_output_tokens
+        logger.info(
+            "Distributed token budget preflight "
+            f"prompt_tokens={len(all_prompt_tokens)} "
+            f"max_output_tokens={max_output_tokens} "
+            f"requested_total={requested_total} "
+            f"prompt_limit={max_prompt_tokens} total_limit={max_total_tokens}"
+        )
+        if (
+            len(all_prompt_tokens) > max_prompt_tokens
+            or requested_total > max_total_tokens
+        ):
+            raise DistributedTokenBudgetError(
+                "Distributed request exceeds the safe token budget: "
+                f"prompt_tokens={len(all_prompt_tokens)}, "
+                f"max_output_tokens={max_output_tokens}, "
+                f"requested_total={requested_total}, "
+                f"prompt_limit={max_prompt_tokens}, "
+                f"total_limit={max_total_tokens}. "
+                "Reduce the input or output size."
+            )
+
+    # Honor the request-level cache setting. Previously this was applied only
+    # to benchmarks, so ordinary requests with use_prefix_cache=False could
+    # still restore and trim a stale pipeline cache.
     is_bench = task.bench
-    if is_bench and not task.use_prefix_cache:
+    if not task.use_prefix_cache:
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
@@ -606,6 +767,18 @@ def mlx_generate(
             frequency_penalty=task.frequency_penalty,
         )
     )
+    # Prefill above consumes the full prompt except for the two-token tail
+    # passed to mlx-lm's stream_generate below. Logits processors therefore
+    # see only that tail plus generated tokens, not the complete prompt.
+    # Supplying len(prompt_tokens) here causes the schema enforcer to discard
+    # generated output until it reaches the original prompt length, leaving
+    # short responses effectively unconstrained.
+    processor_prompt_token_count = min(2, len(prompt_tokens))
+    structured_output_processor = make_json_schema_logits_processor(
+        tokenizer, task.response_format, processor_prompt_token_count
+    )
+    if structured_output_processor is not None:
+        logits_processors.append(structured_output_processor)
     if is_bench:
         # Only sample length eos tokens
         eos_ids = eos_ids_from_tokenizer(tokenizer)
@@ -672,6 +845,7 @@ def mlx_generate(
                 group,
                 on_prefill_progress,
                 distributed_prompt_progress_callback,
+                retain_prefix_snapshots=kv_prefix_cache is not None,
             )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 
@@ -716,6 +890,7 @@ def mlx_generate(
     usage: Usage | None = None
     logger.info("Starting decode")
     mx_barrier(group)
+    effective_kv_bits = _compatible_kv_bits(caches, KV_BITS)
 
     for completion_tokens, out in enumerate(
         stream_generate(
@@ -728,7 +903,7 @@ def mlx_generate(
             prompt_cache=caches,
             prefill_step_size=1,
             kv_group_size=KV_GROUP_SIZE,
-            kv_bits=KV_BITS,
+            kv_bits=effective_kv_bits,
         ),
         start=1,
     ):

@@ -1,6 +1,7 @@
 import codecs
 import contextlib
 import signal
+import time
 from dataclasses import dataclass, field
 from os import PathLike
 from typing import Callable, Self
@@ -14,7 +15,11 @@ from anyio import (
 )
 from loguru import logger
 
-from exo.shared.constants import EXO_RUNNER_STDERR_LOG, EXO_RUNNER_STDOUT_LOG
+from exo.shared.constants import (
+    EXO_RUNNER_LOG_DIR,
+    EXO_RUNNER_STDERR_LOG,
+    EXO_RUNNER_STDOUT_LOG,
+)
 from exo.shared.types.chunks import ErrorChunk
 from exo.shared.types.events import (
     ChunkGenerated,
@@ -222,8 +227,16 @@ class RunnerSupervisor:
             ),
             daemon=True,
         )
+        runner_log_stem = (
+            f"runner-{bound_instance.bound_node_id}-"
+            f"{bound_instance.bound_runner_id}-{bound_instance.instance.instance_id}-"
+            f"{time.time_ns()}"
+        )
         runner_stdio_handler = await RunnerStdioHandler.create(
-            stdout_rx=runner_process.stdout, stderr_rx=runner_process.stderr
+            stdout_rx=runner_process.stdout,
+            stderr_rx=runner_process.stderr,
+            stdout_log_path=EXO_RUNNER_LOG_DIR / f"{runner_log_stem}-stdout.log",
+            stderr_log_path=EXO_RUNNER_LOG_DIR / f"{runner_log_stem}-stderr.log",
         )
 
         shard_metadata = bound_instance.bound_shard
@@ -295,6 +308,20 @@ class RunnerSupervisor:
         except ClosedResourceError:
             self.in_progress.pop(task.task_id, None)
             logger.warning(f"Task {task} dropped, runner closed communication.")
+            # Popping local bookkeeping is not enough: the task stays Pending in
+            # the replicated state forever. The post-generation JACCL recycle
+            # refuses to drain an instance that still has Pending/Running tasks,
+            # so a dropped Shutdown wedged the instance in `_retiring_instances`
+            # permanently and every later request for that model was rejected
+            # with "No instance found". Publish a terminal status so the
+            # replicated state matches what already happened locally.
+            with contextlib.suppress(ClosedResourceError, BrokenResourceError):
+                with anyio.CancelScope(shield=True):
+                    await self._event_sender.send(
+                        TaskStatusUpdated(
+                            task_id=task.task_id, task_status=TaskStatus.Failed
+                        )
+                    )
             return
         await event.wait()
 
@@ -315,6 +342,26 @@ class RunnerSupervisor:
         if scope.cancel_called:
             logger.error("RunnerSupervisor cancel pipe blocked")
             await self._check_runner(TimeoutError("cancel pipe blocked"))
+            return
+        self._tg.start_soon(self._ensure_cancelled, task_id)
+
+    async def abort_for_peer_loss(self, peer_id: str) -> None:
+        """Terminate a distributed runner immediately after a peer disappears."""
+        await self._check_runner(
+            ConnectionError(
+                f"distributed peer {peer_id} expired; aborting inference immediately"
+            )
+        )
+
+    async def _ensure_cancelled(self, task_id: TaskId) -> None:
+        """Restart a runner that remains blocked after cluster cancellation."""
+        await anyio.sleep(30)
+        if task_id not in self.in_progress:
+            return
+        logger.error(
+            f"Task {task_id} did not acknowledge cancellation; restarting runner"
+        )
+        await self._check_runner(TimeoutError(f"task {task_id} cancellation timed out"))
 
     async def _forward_events(self):
         try:

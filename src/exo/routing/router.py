@@ -1,5 +1,6 @@
 import os
 from copy import copy
+from datetime import datetime, timezone
 from itertools import count
 from math import inf
 from pathlib import Path
@@ -104,10 +105,17 @@ class Router:
         namespace: str,
         listen_port: int,
         discovery_service_port: int,
+        discovery_interface: str | None,
+        bootstrap_peers: list[str],
     ) -> "Router":
         return cls(
             handle=NetworkingHandle.new(
-                identity, namespace, listen_port, discovery_service_port
+                identity,
+                namespace,
+                listen_port,
+                discovery_service_port,
+                discovery_interface,
+                bootstrap_peers,
             )
         )
 
@@ -119,6 +127,19 @@ class Router:
         self._tmp_networking_sender: Sender[tuple[str, bytes]] | None = send
         self._id_count = count()
         self._tg: TaskGroup = TaskGroup()
+        self._peer_connections: dict[NodeId, dict[str, object]] = {}
+        self._reconnect_count = 0
+        self._last_network_error: str | None = None
+
+    def health_snapshot(self) -> dict[str, object]:
+        return {
+            "peers": {
+                str(peer_id): dict(status)
+                for peer_id, status in self._peer_connections.items()
+            },
+            "reconnectCount": self._reconnect_count,
+            "lastError": self._last_network_error,
+        }
 
     async def register_topic[T: FrozenModel](self, topic: TypedTopic[T]):
         send = self._tmp_networking_sender
@@ -200,6 +221,17 @@ class Router:
                         await router.publish_bytes(data)
                     case FromSwarm.Connection():
                         message = ConnectionMessage.from_update(from_swarm)
+                        previous = self._peer_connections.get(message.peer_id)
+                        if (
+                            message.connected
+                            and previous is not None
+                            and previous.get("connected") is False
+                        ):
+                            self._reconnect_count += 1
+                        self._peer_connections[message.peer_id] = {
+                            "connected": message.connected,
+                            "changedAt": datetime.now(timezone.utc).isoformat(),
+                        }
                         logger.trace(
                             f"Received message on connection_messages with payload {message}"
                         )
@@ -213,6 +245,7 @@ class Router:
                             "failed to exhaustively check FromSwarm messages - logic error"
                         )
         except Exception as exception:
+            self._last_network_error = str(exception)
             logger.opt(exception=exception).error(
                 "Gossipsub receive loop terminated unexpectedly"
             )

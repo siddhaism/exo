@@ -72,8 +72,12 @@ def entrypoint(
                 event_sender_downcast, cancel_receiver, bound_instance.bound_shard
             )
         else:
+            from exo.worker.engines.mlx.build_info import collect_mlx_build_info
             from exo.worker.engines.mlx.patches import apply_mlx_patches
 
+            build_info = collect_mlx_build_info()
+            os.environ["EXO_MLX_BUILD_ID"] = str(build_info["buildId"])
+            logger.info(f"MLX runtime identity: {build_info}")
             apply_mlx_patches()
 
             from exo.worker.engines.mlx.builder import MlxBuilder

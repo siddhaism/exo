@@ -1,3 +1,4 @@
+import anyio
 import pytest
 from anyio import create_task_group, fail_after, move_on_after
 
@@ -327,7 +328,9 @@ async def test_connection_message_triggers_new_round_broadcast() -> None:
             tg.start_soon(election.run)
 
             # Send any connection message object; we close quickly to cancel before result creation
-            await cm_tx.send(ConnectionMessage(connected=True))
+            await cm_tx.send(
+                ConnectionMessage(connected=True, peer_id=NodeId("PEER"))
+            )
 
             # Expect a broadcast for the new round at clock=1
             while True:
@@ -343,6 +346,80 @@ async def test_connection_message_triggers_new_round_broadcast() -> None:
             co_tx.close()
 
     # After cancellation (before election finishes), no seniority changes asserted here.
+
+
+@pytest.mark.anyio
+async def test_peer_rediscovery_during_grace_does_not_start_election() -> None:
+    em_out_tx, _em_out_rx = channel[ElectionMessage]()
+    em_in_tx, em_in_rx = channel[ElectionMessage]()
+    er_tx, _er_rx = channel[ElectionResult]()
+    cm_tx, cm_rx = channel[ConnectionMessage]()
+    co_tx, co_rx = channel[ForwarderCommand]()
+
+    election = Election(
+        node_id=NodeId("ME"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+        peer_expiry_grace_seconds=0.2,
+    )
+
+    async with create_task_group() as tg:
+        with fail_after(2):
+            tg.start_soon(election.run)
+            await cm_tx.send(
+                ConnectionMessage(connected=False, peer_id=NodeId("PEER"))
+            )
+            await anyio.sleep(0.25)
+            await cm_tx.send(
+                ConnectionMessage(connected=True, peer_id=NodeId("PEER"))
+            )
+            await anyio.sleep(0.25)
+
+            assert election.clock == 0
+
+            em_in_tx.close()
+            cm_tx.close()
+            co_tx.close()
+
+
+@pytest.mark.anyio
+async def test_persistent_peer_expiry_starts_election_after_grace() -> None:
+    em_out_tx, em_out_rx = channel[ElectionMessage]()
+    em_in_tx, em_in_rx = channel[ElectionMessage]()
+    er_tx, _er_rx = channel[ElectionResult]()
+    cm_tx, cm_rx = channel[ConnectionMessage]()
+    co_tx, co_rx = channel[ForwarderCommand]()
+
+    election = Election(
+        node_id=NodeId("ME"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+        peer_expiry_grace_seconds=0.05,
+    )
+
+    async with create_task_group() as tg:
+        with fail_after(2):
+            tg.start_soon(election.run)
+            await cm_tx.send(
+                ConnectionMessage(connected=False, peer_id=NodeId("PEER"))
+            )
+
+            while True:
+                got = await em_out_rx.receive()
+                if got.clock == 1:
+                    break
+
+            assert election.clock == 1
+
+            em_in_tx.close()
+            cm_tx.close()
+            co_tx.close()
 
 
 @pytest.mark.anyio

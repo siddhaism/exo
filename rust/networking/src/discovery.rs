@@ -42,6 +42,7 @@ impl Discovery {
         namespace: [u8; 8],
         listen_port: u16,
         discovery_port: u16,
+        interface: Option<String>,
     ) -> io::Result<Self> {
         let sock = socket2::Socket::new(
             socket2::Domain::IPV6,
@@ -56,12 +57,16 @@ impl Discovery {
         sock.set_multicast_loop_v6(true)?;
         let sock = Arc::new(UdpSocket::from_std(sock.into())?);
         let ifaces: Arc<Mutex<Vec<SocketAddrV6>>> = Default::default();
+        let selected_interface = interface.clone();
         let _sync = Mutex::new(
             netwatcher::watch_interfaces_with_callback({
                 let sock = sock.clone();
                 let ifaces = ifaces.clone();
                 move |update| {
                     for (iface_idx, iface) in update.interfaces.iter() {
+                        if !interface_is_selected(selected_interface.as_deref(), &iface.name) {
+                            continue;
+                        }
                         if iface
                             .ipv6_ips()
                             .all(|addr| addr.is_loopback() || addr.is_unspecified())
@@ -105,6 +110,19 @@ impl Discovery {
             // todo: better error handling here
             .expect("failed to bind discovery watcher"),
         );
+        if let Some(ref interface) = interface
+            && ifaces.lock().is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "discovery interface {interface:?} was not found, has no usable IPv6 address, or does not support IPv6 multicast"
+                ),
+            ));
+        }
+        if let Some(interface) = interface.as_deref() {
+            debug!("discovery restricted to interface {interface}");
+        }
         Ok(Self {
             sock,
             namespace,
@@ -261,6 +279,28 @@ impl Discovery {
             }
         }
         Ok(())
+    }
+}
+
+fn interface_is_selected(selected: Option<&str>, interface_name: &str) -> bool {
+    selected.is_none_or(|selected| selected == interface_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interface_is_selected;
+
+    #[test]
+    fn no_interface_filter_selects_every_interface() {
+        assert!(interface_is_selected(None, "en0"));
+        assert!(interface_is_selected(None, "en1"));
+    }
+
+    #[test]
+    fn interface_filter_selects_only_exact_name() {
+        assert!(interface_is_selected(Some("en0"), "en0"));
+        assert!(!interface_is_selected(Some("en0"), "en1"));
+        assert!(!interface_is_selected(Some("en0"), "en00"));
     }
 }
 

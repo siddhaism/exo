@@ -600,3 +600,62 @@ class TestKVPrefixCacheWithModel:
         assert len(kv_prefix_cache.prompts) == 1
         # The surviving entry should be the newly added one
         assert get_prefix_length(kv_prefix_cache.prompts[0], tokens) == len(tokens)
+
+
+def _stub_entry(cache: KVPrefixCache, last_used: float) -> None:
+    cache.prompts.append(mx.array([1, 2, 3]))
+    cache.caches.append([])
+    cache._snapshots.append(None)
+    cache._media_regions.append([])
+    cache._last_used.append(last_used)
+    cache.prefill_tps.append(0.0)
+
+
+def test_eviction_polls_pressure_even_with_an_empty_cache():
+    """Eviction must take a pressure reading regardless of local cache contents.
+
+    `get_memory_used_percentage` performs an all_gather when a group is present,
+    so the number of readings is the number of collectives. The previous version
+    returned early on an empty cache and short-circuited `len(self.caches) > 0
+    and ...`, so two ranks holding different numbers of entries issued different
+    numbers of collectives and deadlocked the group permanently in prefill.
+    """
+    empty = KVPrefixCache(None)
+    with patch(
+        "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+        return_value=0.95,
+    ) as pressure:
+        empty._evict_if_needed()
+    # Exactly one reading: enough to learn no rank has anything to evict.
+    assert pressure.call_count == 1
+
+
+def test_eviction_reading_count_depends_only_on_entry_count():
+    """Trip count is a function of the agreed entry count, so ranks stay in step."""
+    populated = KVPrefixCache(None)
+    for index in range(3):
+        _stub_entry(populated, float(index))
+
+    with patch(
+        "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+        return_value=0.95,
+    ) as pressure:
+        populated._evict_if_needed()
+
+    assert len(populated.caches) == 0
+    # One reading per eviction, plus the final one that observes an empty cache.
+    assert pressure.call_count == 4
+
+
+def test_eviction_stops_immediately_below_threshold():
+    populated = KVPrefixCache(None)
+    _stub_entry(populated, 0.0)
+
+    with patch(
+        "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+        return_value=0.10,
+    ) as pressure:
+        populated._evict_if_needed()
+
+    assert len(populated.caches) == 1
+    assert pressure.call_count == 1

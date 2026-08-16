@@ -24,14 +24,20 @@ pub struct PyNetworkingHandle {
 #[gen_stub_pyclass_complex_enum]
 #[pyclass(name = "FromSwarm")]
 pub enum PyFromSwarm {
-    Connection { connected: bool },
+    Connection { connected: bool, peer_id: String },
     Message { topic: String, data: Py<PyBytes> },
 }
 impl From<FromSwarm> for PyFromSwarm {
     fn from(value: FromSwarm) -> Self {
         match value {
-            FromSwarm::Discovered {} => Self::Connection { connected: true },
-            FromSwarm::Expired {} => Self::Connection { connected: false },
+            FromSwarm::Discovered { peer_id } => Self::Connection {
+                connected: true,
+                peer_id,
+            },
+            FromSwarm::Expired { peer_id } => Self::Connection {
+                connected: false,
+                peer_id,
+            },
             FromSwarm::Message { topic, data } => Self::Message {
                 topic: topic,
                 data: data.pybytes(),
@@ -64,11 +70,21 @@ impl PyNetworkingHandle {
     // ---- Lifecycle management methods ----
 
     #[staticmethod]
+    #[pyo3(signature = (
+        identity,
+        namespace,
+        listen_port,
+        discovery_service_port,
+        discovery_interface=None,
+        bootstrap_peers=Vec::new()
+    ))]
     pub fn new(
         identity: &str,
         namespace: &str,
         listen_port: u16,
         discovery_service_port: u16,
+        discovery_interface: Option<String>,
+        bootstrap_peers: Vec<String>,
     ) -> PyResult<PyNetworkingHandle> {
         // todo: zenoh self assigned peers
         if listen_port == 0 {
@@ -92,6 +108,8 @@ impl PyNetworkingHandle {
                 from_client,
                 listen_port,
                 discovery_service_port,
+                discovery_interface,
+                bootstrap_peers,
             ))
             .pyerr()?;
 

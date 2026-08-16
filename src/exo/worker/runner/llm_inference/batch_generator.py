@@ -32,6 +32,7 @@ from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
 from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
+    DistributedTokenBudgetError,
     PrefillCancelled,
     mlx_generate,
     warmup_inference,
@@ -189,6 +190,19 @@ class SequentialGenerator(Engine):
                 output.append((task.task_id, parsed))
 
         except (StopIteration, PrefillCancelled):
+            output.append((task.task_id, FinishedResponse()))
+            self._active = None
+            if self._queue:
+                self._start_next()
+
+        except DistributedTokenBudgetError as e:
+            # Deterministic across ranks and raised before any collective, so
+            # every rank drops this task at the same point and the group stays
+            # in lockstep. Report it to the client and keep serving: killing the
+            # runner would tear down the whole distributed instance and force a
+            # full model reload over one oversized request.
+            logger.warning(f"Rejecting task {task.task_id}: {e}")
+            self._send_error(task, e)
             output.append((task.task_id, FinishedResponse()))
             self._active = None
             if self._queue:

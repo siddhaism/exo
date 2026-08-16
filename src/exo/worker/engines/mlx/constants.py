@@ -1,8 +1,11 @@
+import os
+
 # TODO: Do we want so many constants?
 #  I think we want a lot of these as parameters?
 
 KV_GROUP_SIZE: int | None = 32
-KV_BITS: int | None = None
+_kv_bits = os.getenv("EXO_MLX_KV_BITS", "none").strip().lower()
+KV_BITS: int | None = None if _kv_bits in {"", "none", "0"} else int(_kv_bits)
 ATTENTION_KV_BITS: int | None = 4
 MAX_TOKENS: int = 32168
 MAX_KV_SIZE: int | None = 3200
