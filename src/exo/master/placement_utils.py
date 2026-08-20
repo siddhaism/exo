@@ -476,16 +476,30 @@ def get_mlx_jaccl_coordinators(
             coordinator_network = node_network.get(
                 coordinator, NodeNetworkInfo()
             )
-            matching_ips = [
+            configured_ips = [
                 interface.ip_address
                 for interface in coordinator_network.interfaces
                 if interface.name == requested_interface
-                and interface.ip_address in reachable_ips
             ]
+            matching_ips = [ip for ip in configured_ips if ip in reachable_ips]
             if matching_ips:
                 selected = matching_ips[0]
                 logger.info(
                     "Pinned MLX JACCL coordinator traffic to "
+                    f"interface={requested_interface} address={selected}"
+                )
+                return selected
+            # Discovery can report the RDMA edge before it reports the reverse
+            # socket edge. The selected cycle has already been verified as fully
+            # RDMA-connected, and the operator explicitly pinned coordinator
+            # traffic to this interface, so use its advertised IPv4 address
+            # instead of making placement depend on socket-edge arrival order.
+            configured_ipv4 = [ip for ip in configured_ips if ":" not in ip]
+            if configured_ipv4:
+                selected = configured_ipv4[0]
+                logger.warning(
+                    "No matching reverse socket edge for the configured MLX "
+                    "JACCL coordinator interface; using its advertised address "
                     f"interface={requested_interface} address={selected}"
                 )
                 return selected

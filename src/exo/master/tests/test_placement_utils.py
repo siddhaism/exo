@@ -437,6 +437,43 @@ def test_get_mlx_jaccl_coordinators():
     ), "node_c should use the IP from conn_c_a"
 
 
+def test_jaccl_coordinator_uses_pinned_interface_when_reverse_socket_edge_is_late(
+    monkeypatch,
+):
+    coordinator = NodeId()
+    peer = NodeId()
+    topology = Topology()
+    topology.add_node(coordinator)
+    topology.add_node(peer)
+    # Only coordinator -> peer has arrived. Resolving peer -> coordinator used
+    # to fail even though the explicitly selected coordinator interface exists.
+    topology.add_connection(
+        Connection(
+            source=coordinator,
+            sink=peer,
+            edge=create_socket_connection(1),
+        )
+    )
+    node_network = {
+        coordinator: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(name="en0", ip_address="192.168.77.1")
+            ]
+        )
+    }
+    monkeypatch.setenv("EXO_JACCL_COORDINATOR_INTERFACE", "en0")
+
+    result = get_mlx_jaccl_coordinators(
+        coordinator,
+        coordinator_port=5000,
+        cycle_digraph=topology,
+        node_network=node_network,
+    )
+
+    assert result[coordinator] == "0.0.0.0:5000"
+    assert result[peer] == "192.168.77.1:5000"
+
+
 class TestAllocateLayersProportionally:
     def test_empty_node_list_raises(self):
         with pytest.raises(ValueError, match="empty node list"):
