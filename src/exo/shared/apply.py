@@ -49,6 +49,7 @@ from exo.shared.types.worker.runners import (
     RunnerId,
     RunnerReady,
     RunnerShutdown,
+    RunnerShuttingDown,
     RunnerStatus,
 )
 from exo.utils.info_gatherer.info_gatherer import (
@@ -278,6 +279,29 @@ def apply_instance_link_deleted(event: InstanceLinkDeleted, state: State) -> Sta
 
 
 def apply_runner_status_updated(event: RunnerStatusUpdated, state: State) -> State:
+    generation = event.runner_status.data_plane_generation
+    if (
+        isinstance(event.runner_status, RunnerShuttingDown)
+        and generation is not None
+        and InstanceId(generation) not in state.instances
+    ):
+        # InstanceDeleted purges every runner in the deleted generation. A runner
+        # process may publish ShuttingDown slightly later; accepting that event
+        # resurrects an orphan runner that survives event-log replay forever and
+        # keeps cluster data-plane health false even though no instance owns it.
+        new_runners = {
+            rid: status
+            for rid, status in state.runners.items()
+            if rid != event.runner_id
+        }
+        new_ports = {
+            rid: port
+            for rid, port in state.prefill_server_ports.items()
+            if rid != event.runner_id
+        }
+        return state.model_copy(
+            update={"runners": new_runners, "prefill_server_ports": new_ports}
+        )
     if isinstance(event.runner_status, RunnerShutdown):
         new_runners: Mapping[RunnerId, RunnerStatus] = {
             rid: rs for rid, rs in state.runners.items() if rid != event.runner_id
